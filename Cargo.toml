@@ -17,9 +17,9 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-candle-core = { git = "https://github.com/huggingface/candle.git", package = "candle-core", rev = "0.9.1" }
-candle-examples = { git = "https://github.com/huggingface/candle.git", package = "candle-examples", rev = "0.9.1" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", package = "candle-nn", rev = "0.9.1" }
+candle-core = { git = "https://github.com/huggingface/candle.git", package = "candle-core", rev = "0.9.1", features = ["metal", "accelerate"] }
+candle-examples = { git = "https://github.com/huggingface/candle.git", package = "candle-examples", rev = "0.9.1", features = ["metal", "accelerate"] }
+candle-nn = { git = "https://github.com/huggingface/candle.git", package = "candle-nn", rev = "0.9.1", features = ["metal", "accelerate"] }
 either = "1.9.0"
 serde_json = "1.0.107"
 thiserror = "2.0.12"
