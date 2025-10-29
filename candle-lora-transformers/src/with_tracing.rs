@@ -70,7 +70,7 @@ impl Module for TracedLoraEmbedding {
 #[derive(Debug, AutoLoraConvert)]
 #[replace_layer_fields]
 pub struct TracedLoraLinear {
-    pub inner: Linear,
+    inner: Linear,
     span: tracing::Span,
 }
 
