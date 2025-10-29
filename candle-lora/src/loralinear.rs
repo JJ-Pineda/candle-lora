@@ -133,8 +133,8 @@ impl Module for LoraLinear {
                     input.clone()
                 };
 
-                result =
-                    (result + self.ff_b.forward(&self.ff_a.forward(&input_new)?))?.mul(scale)?;
+                let adapter_out = self.ff_b.forward(&self.ff_a.forward(&input_new)?)?.mul(scale)?;
+                result = (result + adapter_out)?;
             }
             Ok(result)
         }

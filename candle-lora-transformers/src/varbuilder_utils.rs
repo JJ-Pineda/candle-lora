@@ -64,7 +64,7 @@ fn verify_name(name: &str) -> String {
         name.to_string()
     };
 
-    return new_name
+    return new_name;
 }
 
 /// Load tensors into a VarBuilder backed by a VarMap using NpzTensors.
