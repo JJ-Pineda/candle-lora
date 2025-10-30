@@ -64,20 +64,16 @@ fn token_to_string(tokenizer: &Tokenizer, id: u32) -> Result<Option<String>> {
 fn test_qwen3() -> Result<()> {
     // --- Gate: only run when files are provided ---
     let Some(cfg_path) = get_env("QWEN3_CONFIG") else {
-        eprintln!("SKIP qwen3-lora test (missing QWEN3_CONFIG).");
-        return Ok(());
+        panic!("Missing QWEN3_CONFIG");
     };
     let Some(tok_path) = get_env("QWEN3_TOKENIZER") else {
-        eprintln!("SKIP qwen3-lora test (missing QWEN3_TOKENIZER).");
-        return Ok(());
+        panic!("Missing QWEN3_TOKENIZER");
     };
     let Some(base_dir) = get_env("QWEN3_WEIGHTS_DIR") else {
-        eprintln!("SKIP qwen3-lora test (missing QWEN3_WEIGHTS_DIR).");
-        return Ok(());
+        panic!("Missing QWEN3_WEIGHTS_DIR");
     };
     let Some(adapter_dir) = get_env("LORA_WEIGHTS_DIR") else {
-        eprintln!("SKIP qwen3-lora test (missing LORA_WEIGHTS_DIR).");
-        return Ok(());
+        panic!("Missing LORA_WEIGHTS_DIR");
     };
 
     // --- Load config & tokenizer ---

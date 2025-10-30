@@ -3,3 +3,4 @@ Cargo.lock
 *.safetensors
 loss.html
 .hf_token
+/candle-lora-transformers/assets/
