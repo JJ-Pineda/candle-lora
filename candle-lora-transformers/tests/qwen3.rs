@@ -93,29 +93,18 @@ fn test_qwen3() -> Result<()> {
         DType::F32
     };
 
-    let base_weight_files =
+    let mut weight_files =
         collect_safetensors(&base_dir).context("collecting base model .safetensors")?;
 
-    let adapter_weight_files =
-        collect_safetensors(&adapter_dir).context("collecting LoRA adapter .safetensors")?;
-
-    // --- Combine all weight files into a single list ---
-    let mut all_weight_files = base_weight_files.clone();
-    all_weight_files.extend(adapter_weight_files);
-
     // --- Load base weights separately for comparison ---
-    let base_vb = from_mmaped_safetensors(&base_weight_files, dtype, &device, false)
+    let vb = from_mmaped_safetensors(&weight_files, dtype, &device, false)
         .context("constructing VarBuilder for base weights")?;
-
-    // --- Load all weights (base + adapter) in a single VarBuilder ---
-    let vb = from_mmaped_safetensors(&all_weight_files, dtype, &device, false)
-        .context("constructing VarBuilder for all weights")?;
 
     // --- LoRA config (adjust rank/alpha if needed) ---
     let lora_cfg = LoraConfig::new(256, 512.0, Some(0f32));
 
     // --- Build model ---
-    let mut model = ModelForCausalLM::new(&cfg, base_vb, lora_cfg.clone())
+    let mut model = ModelForCausalLM::new(&cfg, vb, lora_cfg.clone())
         .context("building Qwen3 ModelForCausalLM without trained adapter weights")?;
 
     // --- Tiny generation loop (greedy / top-p+temp) ---
@@ -128,6 +117,12 @@ fn test_qwen3() -> Result<()> {
         .to_vec();
 
     let logits_base = run_logits(&mut model, &ids, &device)?.to_dtype(DType::F32)?;
+
+    std::mem::drop(model);
+    weight_files
+        .extend(collect_safetensors(&adapter_dir).context("collecting LoRA adapter .safetensors")?);
+    let vb = from_mmaped_safetensors(&weight_files, dtype, &device, false)
+        .context("constructing VarBuilder for base weights")?;
 
     let mut model = ModelForCausalLM::new(&cfg, vb, lora_cfg.clone())
         .context("building Qwen3 ModelForCausalLM with trained adapter weights")?;
