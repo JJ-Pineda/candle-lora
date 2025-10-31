@@ -99,23 +99,24 @@ impl Merge for LoraLinear {
             None => ba,
         };
 
-        // For DoRA, apply magnitude normalization
+        // For DoRA, apply magnitude normalization (row-wise)
         if let Some(ref m) = self.m {
             let w = self.old.weight();
 
             // Compute row-wise norms of W + scaled_BA
+            // DoRA uses row-wise normalization per output channel (Section 3.1)
             let w_plus_ba = (w + &scaled_ba).map_err(Either::Right)?;
             let norms = w_plus_ba
                 .sqr()
                 .map_err(Either::Right)?
-                .sum_keepdim(1)
+                .sum_keepdim(1) // Row-wise: sum over in_features dimension
                 .map_err(Either::Right)?
                 .sqrt()
                 .map_err(Either::Right)?
                 .squeeze(1)
                 .map_err(Either::Right)?;
 
-            // Normalized weight: (m / norms) * (W + scaled_BA)
+            // Normalized weight: m * (W + scaled_BA) / ||W + scaled_BA||_2
             let norm_scale = m.broadcast_div(&norms).map_err(Either::Right)?;
             let normalized = w_plus_ba
                 .broadcast_mul(&norm_scale)
@@ -177,28 +178,57 @@ impl Module for LoraLinear {
                 };
 
                 if let Some(ref m) = self.m {
-                    // DoRA implementation
-                    // DoRA: output = (m / ||W + scale*BA||) * ((W + scale*BA) @ x)
+                    // DoRA implementation (memory-efficient, row-wise normalization)
+                    // DoRA: W' = m * (W + scale*BA) / ||W + scale*BA||_2
+                    // where ||·||_2 is row-wise L2 norm (norm across in_features for each out_feature)
+                    // Per DoRA paper Section 3.1: magnitude is computed per output channel (row)
 
-                    // Compute forward pass: (W + scale*BA) @ x = W@x + scale*B@A@x
-                    let w_out = input_new.broadcast_matmul(&self.old.weight().t()?)?;
+                    // Note: `result` already contains W@x from line 169
+
+                    // Compute adapter output: scale*B@A@x
                     let a_out = self.ff_a.forward(&input_new)?;
                     let ba_out = self.ff_b.forward(&a_out)?.mul(scale)?;
-                    let combined = (w_out + ba_out)?;
 
-                    // Compute row norms of W + scale*BA lazily
-                    // This is expensive but only done once per forward pass
-                    let w = self.old.weight();
-                    let ba = self.ff_b.weight().matmul(self.ff_a.weight())?.mul(scale)?;
+                    // Combined output: W@x + scale*B@A@x
+                    let combined = (&result + &ba_out)?;
 
-                    // ||W_i + BA_i||² = ||W_i||² + 2*W_i·BA_i + ||BA_i||²
-                    let w_norm_sq = w.sqr()?.sum_keepdim(1)?;
-                    let ba_norm_sq = ba.sqr()?.sum_keepdim(1)?;
-                    let cross = (w * &ba)?.sum_keepdim(1)?.mul(2.0)?;
-                    let norms = (w_norm_sq + cross + ba_norm_sq)?.sqrt()?.squeeze(1)?;
+                    // Compute row-wise norms of W + scale*BA efficiently
+                    // WITHOUT materializing the full BA matrix
+                    // For each row i: ||W_i + scale*BA_i||² = sum_j (W_ij + scale*(BA)_ij)²
+                    // We use: ||W_i + scale*BA_i||² = ||W_i||² + 2*scale*W_i·(BA)_i + scale²||BA_i||²
 
-                    // Apply DoRA: (m / norms) * combined
-                    let norm_scale = m.broadcast_div(&norms)?;
+                    let w = self.old.weight(); // [out_features, in_features]
+                    let b_weight = self.ff_b.weight(); // [out_features, rank]
+                    let a_weight = self.ff_a.weight(); // [rank, in_features]
+
+                    // Compute ||W_i||² for each row (sum over in_features dimension)
+                    let w_norm_sq = w.sqr()?.sum_keepdim(1)?; // [out_features, 1]
+
+                    // Compute ||BA_i||² efficiently using the kernel trick
+                    // For each row i: ||BA_i||² = (BA)(BA)^T_ii = (B @ A @ A^T @ B^T)_ii
+                    // We compute: B @ (A @ A^T) @ B^T and take diagonal elements
+                    let aat = a_weight.matmul(&a_weight.t()?)?; // [rank, rank]
+                    let b_aat = b_weight.matmul(&aat)?; // [out_features, rank]
+                    let ba_norm_sq = (b_aat * b_weight)?.sum_keepdim(1)?; // [out_features, 1]
+
+                    // Compute 2*W_i·(BA)_i efficiently
+                    // For each row i: W_i · (BA)_i = sum_j W_ij * (BA)_ij
+                    // where (BA)_ij = sum_k B_ik * A_kj
+                    // So: sum_j W_ij * sum_k B_ik * A_kj = sum_k B_ik * sum_j W_ij * A_kj
+                    //                                    = sum_k B_ik * (W @ A^T)_ik
+                    //                                    = (W @ A^T) ⊙ B summed over k for each row
+                    let wa_t = w.matmul(&a_weight.t()?)?; // [out_features, rank]
+                    let cross = (wa_t * b_weight)?.sum_keepdim(1)?.mul(2.0 * scale)?; // [out_features, 1]
+
+                    // ||W + scale*BA||² = ||W||² + 2*scale*W·BA + scale²||BA||²
+                    let norms = (w_norm_sq + cross + ba_norm_sq.mul(scale * scale)?)?
+                        .sqrt()?
+                        .squeeze(1)?; // [out_features]
+
+                    // Apply DoRA row-wise: m * combined / norms
+                    // m is [out_features], norms is [out_features]
+                    // This normalizes each output feature (row) independently
+                    let norm_scale = m.broadcast_div(&norms)?; // [out_features]
                     result = combined.broadcast_mul(&norm_scale)?;
 
                     // Add bias if present
