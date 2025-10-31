@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_lora::{LoraConfig, LoraLinear, LoraLinearConfig};
+use candle_lora::{LoraConfig, LoraLinear, LoraLinearConfig, MultiLoraLinear};
 use candle_nn::{kv_cache::KvCache, Activation, VarBuilder};
 use std::sync::Arc;
 

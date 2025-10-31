@@ -7,6 +7,7 @@ pub use loraconv1d::{LoraConv1d, LoraConv1dConfig};
 pub use loraconv2d::{LoraConv2d, LoraConv2dConfig};
 pub use loraembed::{LoraEmbedding, LoraEmbeddingConfig};
 pub use loralinear::{LoraLinear, LoraLinearConfig};
+pub use multiloralinear::MultiLoraLinear;
 use std::{collections::HashMap, fmt::Debug, hash::Hash};
 use thiserror::Error;
 
@@ -17,6 +18,7 @@ mod loraconv1d;
 mod loraconv2d;
 mod loraembed;
 mod loralinear;
+mod multiloralinear;
 
 pub struct Lora;
 
