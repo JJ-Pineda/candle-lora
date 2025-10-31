@@ -19,6 +19,7 @@ pub struct LoraLinear {
     merged: bool,
     prefix: String,
     id: usize,
+    m: Option<Tensor>, // DoRA magnitude vector
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +57,23 @@ impl LoraLinear {
             init::ZERO,
         )?;
 
+        // Try to load magnitude vector for DoRA (only if it exists in checkpoint)
+        // VarBuilder.get() will create the tensor if it doesn't exist (with zeros)
+        // Real DoRA magnitude vectors should have non-zero values, so we check for this
+        let m = match vb
+            .pp(format!("m{id}"))
+            .get(linear_config.out_features, "weight")
+        {
+            Ok(tensor) => {
+                // Check if it's all zeros (meaning it was just created, not loaded)
+                match tensor.mean_all().and_then(|t| t.to_scalar::<f32>()) {
+                    Ok(mean) if mean.abs() > 1e-10 => Some(tensor), // Non-zero, real DoRA vector
+                    _ => None, // All zeros or error, treat as not present
+                }
+            }
+            Err(_) => None, // Error loading, treat as not present
+        };
+
         Ok(LoraLinear {
             old: Arc::new(FrozenLinear::new_from_linear(old)?),
             ff_a: Linear::new(a, None),
@@ -69,21 +87,52 @@ impl LoraLinear {
             merged: false,
             prefix: vb.prefix(),
             id,
+            m,
         })
     }
 }
 
 impl Merge for LoraLinear {
     fn get_delta_weight(&self) -> std::result::Result<Tensor, MergeErrorOrError> {
-        let result = self
+        let ba = self
             .ff_b
             .weight()
             .matmul(self.ff_a.weight())
             .map_err(Either::Right)?;
-        Ok(match self.scale {
-            Some(scale) => result.mul(scale).map_err(Either::Right)?,
-            None => result,
-        })
+
+        let scaled_ba = match self.scale {
+            Some(scale) => ba.mul(scale).map_err(Either::Right)?,
+            None => ba,
+        };
+
+        // For DoRA, apply magnitude normalization
+        if let Some(ref m) = self.m {
+            let w = self.old.weight();
+
+            // Compute row-wise norms of W + scaled_BA
+            let w_plus_ba = (w + &scaled_ba).map_err(Either::Right)?;
+            let norms = w_plus_ba
+                .sqr()
+                .map_err(Either::Right)?
+                .sum_keepdim(1)
+                .map_err(Either::Right)?
+                .sqrt()
+                .map_err(Either::Right)?
+                .squeeze(1)
+                .map_err(Either::Right)?;
+
+            // Normalized weight: (m / norms) * (W + scaled_BA)
+            let norm_scale = m.broadcast_div(&norms).map_err(Either::Right)?;
+            let normalized = w_plus_ba
+                .broadcast_mul(&norm_scale)
+                .map_err(Either::Right)?;
+
+            // Delta is normalized - W
+            Ok((normalized - w).map_err(Either::Right)?)
+        } else {
+            // Standard LoRA
+            Ok(scaled_ba)
+        }
     }
 
     fn merge_weights(&mut self) -> std::result::Result<(), MergeErrorOrError> {
@@ -133,8 +182,43 @@ impl Module for LoraLinear {
                     input.clone()
                 };
 
-                let adapter_out = self.ff_b.forward(&self.ff_a.forward(&input_new)?)?.mul(scale)?;
-                result = (result + adapter_out)?;
+                if let Some(ref m) = self.m {
+                    // DoRA implementation
+                    // DoRA: output = (m / ||W + scale*BA||) * ((W + scale*BA) @ x)
+
+                    // Compute forward pass: (W + scale*BA) @ x = W@x + scale*B@A@x
+                    let w_out = input_new.broadcast_matmul(&self.old.weight().t()?)?;
+                    let a_out = self.ff_a.forward(&input_new)?;
+                    let ba_out = self.ff_b.forward(&a_out)?.mul(scale)?;
+                    let combined = (w_out + ba_out)?;
+
+                    // Compute row norms of W + scale*BA lazily
+                    // This is expensive but only done once per forward pass
+                    let w = self.old.weight();
+                    let ba = self.ff_b.weight().matmul(self.ff_a.weight())?.mul(scale)?;
+
+                    // ||W_i + BA_i||² = ||W_i||² + 2*W_i·BA_i + ||BA_i||²
+                    let w_norm_sq = w.sqr()?.sum_keepdim(1)?;
+                    let ba_norm_sq = ba.sqr()?.sum_keepdim(1)?;
+                    let cross = (w * &ba)?.sum_keepdim(1)?.mul(2.0)?;
+                    let norms = (w_norm_sq + cross + ba_norm_sq)?.sqrt()?.squeeze(1)?;
+
+                    // Apply DoRA: (m / norms) * combined
+                    let norm_scale = m.broadcast_div(&norms)?;
+                    result = combined.broadcast_mul(&norm_scale)?;
+
+                    // Add bias if present
+                    if let Some(bias) = self.old.bias() {
+                        result = result.broadcast_add(bias)?;
+                    }
+                } else {
+                    // Standard LoRA implementation
+                    let adapter_out = self
+                        .ff_b
+                        .forward(&self.ff_a.forward(&input_new)?)?
+                        .mul(scale)?;
+                    result = (result + adapter_out)?;
+                }
             }
             Ok(result)
         }
@@ -151,6 +235,13 @@ impl Saveable for LoraLinear {
             self.prefix.clone() + &format!(".b{}.weight", self.id),
             self.ff_b.weight().clone(),
         );
+        // Save magnitude vector if DoRA is used
+        if let Some(ref m) = self.m {
+            accum.insert(
+                self.prefix.clone() + &format!(".m{}.weight", self.id),
+                m.clone(),
+            );
+        }
     }
 }
 

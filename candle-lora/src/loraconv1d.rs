@@ -19,6 +19,7 @@ pub struct LoraConv1d {
     merged: bool,
     prefix: String,
     id: usize,
+    m: Option<Tensor>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +65,18 @@ impl LoraConv1d {
             init::ZERO,
         )?;
 
+        // Try to load magnitude vector for DoRA
+        let m = vb
+            .pp(format!("m{id}"))
+            .get(
+                (
+                    conv_config.out_channels / old.config().groups,
+                    conv_config.in_channels * conv_config.kernel_size,
+                ),
+                "weight",
+            )
+            .ok();
+
         Ok(LoraConv1d {
             old: Arc::new(FrozenConv1d::new_from_conv1d(old)?),
             a,
@@ -77,23 +90,52 @@ impl LoraConv1d {
             merged: false,
             prefix: vb.prefix(),
             id,
+            m,
         })
     }
 }
 
 impl Merge for LoraConv1d {
     fn get_delta_weight(&self) -> std::result::Result<Tensor, MergeErrorOrError> {
-        let result = self
+        let ba = self
             .b
             .matmul(&self.a)
             .map_err(Either::Right)?
             .reshape(self.old.weight().shape())
             .map_err(Either::Right)?;
 
-        Ok(match self.scale {
-            Some(scale) => result.mul(scale).map_err(Either::Right)?,
-            None => result,
-        })
+        let scaled_ba = match self.scale {
+            Some(scale) => ba.mul(scale).map_err(Either::Right)?,
+            None => ba,
+        };
+
+        // For DoRA, apply magnitude normalization
+        if let Some(ref m) = self.m {
+            let w = self.old.weight();
+
+            // Compute column-wise norms of W + scaled_BA
+            let w_plus_ba = (w + &scaled_ba).map_err(Either::Right)?;
+            let norms = w_plus_ba
+                .sqr()
+                .map_err(Either::Right)?
+                .sum_keepdim(0)
+                .map_err(Either::Right)?
+                .sqrt()
+                .map_err(Either::Right)?;
+
+            // Normalized weight: (m / norms) * (W + scaled_BA)
+            let normalized = w_plus_ba
+                .broadcast_div(&norms)
+                .map_err(Either::Right)?
+                .broadcast_mul(m)
+                .map_err(Either::Right)?;
+
+            // Delta is normalized - W
+            Ok((normalized - w).map_err(Either::Right)?)
+        } else {
+            // Standard LoRA
+            Ok(scaled_ba)
+        }
     }
 
     fn merge_weights(&mut self) -> std::result::Result<(), MergeErrorOrError> {
@@ -144,15 +186,38 @@ impl Module for LoraConv1d {
             if self.dropout.is_some() {
                 weight = self.dropout.as_ref().unwrap().forward(input, true)?;
             }
-            let weight = (&weight
-                + &self
+
+            if let Some(ref m) = self.m {
+                // DoRA implementation
+                // Calculate W' = W + BA * scale
+                let delta = self
                     .b
                     .broadcast_matmul(&self.a.broadcast_matmul(&weight)?)?
                     .reshape(self.old.weight().shape())?
-                    .mul(scale)?)?;
+                    .mul(scale)?;
+                let w_prime = (&weight + &delta)?;
 
-            let conv = Conv1d::new(weight, bias, *self.config());
-            conv.forward(input)
+                // Calculate column-wise norm of W'
+                let w_prime_norm = w_prime.sqr()?.sum_keepdim(0)?.sqrt()?;
+
+                // Apply magnitude vector and normalize: m * W' / ||W'||
+                let normalized_weight = w_prime.broadcast_div(&w_prime_norm)?;
+                let scaled_weight = normalized_weight.broadcast_mul(m)?;
+
+                let conv = Conv1d::new(scaled_weight, bias, *self.config());
+                conv.forward(input)
+            } else {
+                // Standard LoRA implementation
+                let weight = (&weight
+                    + &self
+                        .b
+                        .broadcast_matmul(&self.a.broadcast_matmul(&weight)?)?
+                        .reshape(self.old.weight().shape())?
+                        .mul(scale)?)?;
+
+                let conv = Conv1d::new(weight, bias, *self.config());
+                conv.forward(input)
+            }
         } else {
             self.old.forward(input)
         }
@@ -169,6 +234,13 @@ impl Saveable for LoraConv1d {
             self.prefix.clone() + &format!(".b{}.weight", self.id),
             self.b.clone(),
         );
+        // Save magnitude vector if DoRA is used
+        if let Some(ref m) = self.m {
+            accum.insert(
+                self.prefix.clone() + &format!(".m{}.weight", self.id),
+                m.clone(),
+            );
+        }
     }
 }
 
