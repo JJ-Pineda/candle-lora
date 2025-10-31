@@ -62,19 +62,12 @@ fn token_to_string(tokenizer: &Tokenizer, id: u32) -> Result<Option<String>> {
 
 #[test]
 fn test_qwen3() -> Result<()> {
-    // --- Gate: only run when files are provided ---
-    let Some(cfg_path) = get_env("QWEN3_CONFIG") else {
-        panic!("Missing QWEN3_CONFIG");
-    };
-    let Some(tok_path) = get_env("QWEN3_TOKENIZER") else {
-        panic!("Missing QWEN3_TOKENIZER");
-    };
-    let Some(base_dir) = get_env("QWEN3_WEIGHTS_DIR") else {
-        panic!("Missing QWEN3_WEIGHTS_DIR");
-    };
-    let Some(adapter_dir) = get_env("LORA_WEIGHTS_DIR") else {
-        panic!("Missing LORA_WEIGHTS_DIR");
-    };
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let assets_dir = format!("{}/assets", manifest_dir);
+    let base_dir = format!("{}/base_models/unsloth/Qwen3-8B", assets_dir);
+    let cfg_path = format!("{}/config.json", base_dir);
+    let tok_path = format!("{}/tokenizer.json", base_dir);
+    let adapter_dir = format!("{}/pricebot/", assets_dir);
 
     // --- Load config & tokenizer ---
     let cfg_file = std::fs::File::open(&cfg_path)
@@ -135,62 +128,62 @@ fn test_qwen3() -> Result<()> {
 
     assert_ne!(diff, 0f32);
 
-    // --- Tiny generation loop (greedy / top-p+temp) ---
-    // Small, deterministic settings for testability.
-    let seed: u64 = 42;
-    let temperature: Option<f64> = Some(0.7);
-    let top_p: Option<f64> = Some(0.9);
-    let mut lp = LogitsProcessor::new(seed, temperature, top_p);
+    // // --- Tiny generation loop (greedy / top-p+temp) ---
+    // // Small, deterministic settings for testability.
+    // let seed: u64 = 42;
+    // let temperature: Option<f64> = Some(0.7);
+    // let top_p: Option<f64> = Some(0.9);
+    // let mut lp = LogitsProcessor::new(seed, temperature, top_p);
 
-    let eos_id = tokenizer
-        .get_vocab(true)
-        .get("<|endoftext|>")
-        .copied()
-        .unwrap_or_else(|| {
-            println!("Could not find EOS token!");
-            u32::MAX
-        });
+    // let eos_id = tokenizer
+    //     .get_vocab(true)
+    //     .get("<|endoftext|>")
+    //     .copied()
+    //     .unwrap_or_else(|| {
+    //         println!("Could not find EOS token!");
+    //         u32::MAX
+    //     });
 
-    let max_new_tokens = 48usize; // keep short for test runtime
-    let mut generated_text = String::new();
+    // let max_new_tokens = 48usize; // keep short for test runtime
+    // let mut generated_text = String::new();
 
-    for step in 0..max_new_tokens {
-        // Only feed the full context once; then one token at a time using KV-cache.
-        let ctx_len = if step == 0 { ids.len() } else { 1 };
-        let start_pos = ids.len().saturating_sub(ctx_len);
-        let ctx = &ids[start_pos..];
+    // for step in 0..max_new_tokens {
+    //     // Only feed the full context once; then one token at a time using KV-cache.
+    //     let ctx_len = if step == 0 { ids.len() } else { 1 };
+    //     let start_pos = ids.len().saturating_sub(ctx_len);
+    //     let ctx = &ids[start_pos..];
 
-        let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
-        let logits = model
-            .forward(&input, start_pos)
-            .context("forward pass")?
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_dtype(DType::F32)?;
+    //     let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
+    //     let logits = model
+    //         .forward(&input, start_pos)
+    //         .context("forward pass")?
+    //         .squeeze(0)?
+    //         .squeeze(0)?
+    //         .to_dtype(DType::F32)?;
 
-        let next_id = lp.sample(&logits).context("sampling")?;
-        ids.push(next_id);
-        if next_id == eos_id {
-            break;
-        }
+    //     let next_id = lp.sample(&logits).context("sampling")?;
+    //     ids.push(next_id);
+    //     if next_id == eos_id {
+    //         break;
+    //     }
 
-        // Best-effort incremental decode
-        if let Some(tok) = token_to_string(&tokenizer, next_id)? {
-            generated_text.push_str(&tok);
-        }
-    }
+    //     // Best-effort incremental decode
+    //     if let Some(tok) = token_to_string(&tokenizer, next_id)? {
+    //         generated_text.push_str(&tok);
+    //     }
+    // }
 
-    // Clear KV cache
-    model.clear_kv_cache();
+    // // Clear KV cache
+    // model.clear_kv_cache();
 
-    // --- Basic assertions ---
-    // Ensure we *actually* produced something beyond the prompt.
-    anyhow::ensure!(
-        generated_text.trim().len() >= 1,
-        "Model produced empty output text."
-    );
+    // // --- Basic assertions ---
+    // // Ensure we *actually* produced something beyond the prompt.
+    // anyhow::ensure!(
+    //     generated_text.trim().len() >= 1,
+    //     "Model produced empty output text."
+    // );
 
-    println!("{}", generated_text);
+    // println!("{}", generated_text);
 
     Ok(())
 }

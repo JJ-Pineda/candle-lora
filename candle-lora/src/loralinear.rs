@@ -60,18 +60,12 @@ impl LoraLinear {
         // Try to load magnitude vector for DoRA (only if it exists in checkpoint)
         // VarBuilder.get() will create the tensor if it doesn't exist (with zeros)
         // Real DoRA magnitude vectors should have non-zero values, so we check for this
-        let m = match vb
-            .pp(format!("m{id}"))
-            .get(linear_config.out_features, "weight")
-        {
-            Ok(tensor) => {
-                // Check if it's all zeros (meaning it was just created, not loaded)
-                match tensor.mean_all().and_then(|t| t.to_scalar::<f32>()) {
-                    Ok(mean) if mean.abs() > 1e-10 => Some(tensor), // Non-zero, real DoRA vector
-                    _ => None, // All zeros or error, treat as not present
-                }
-            }
-            Err(_) => None, // Error loading, treat as not present
+        let m: Option<Tensor> = if vb.contains_tensor(&format!("m{id}.weight")) {
+            vb.pp(format!("m{id}"))
+                .get(linear_config.out_features, "weight")
+                .ok()
+        } else {
+            None
         };
 
         Ok(LoraLinear {

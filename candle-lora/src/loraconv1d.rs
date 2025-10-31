@@ -66,16 +66,19 @@ impl LoraConv1d {
         )?;
 
         // Try to load magnitude vector for DoRA
-        let m = vb
-            .pp(format!("m{id}"))
-            .get(
-                (
-                    conv_config.out_channels / old.config().groups,
-                    conv_config.in_channels * conv_config.kernel_size,
-                ),
-                "weight",
-            )
-            .ok();
+        let m: Option<Tensor> = if vb.contains_tensor(&format!("m{id}.weight")) {
+            vb.pp(format!("m{id}"))
+                .get(
+                    (
+                        conv_config.out_channels / old.config().groups,
+                        conv_config.in_channels * conv_config.kernel_size,
+                    ),
+                    "weight",
+                )
+                .ok()
+        } else {
+            None
+        };
 
         Ok(LoraConv1d {
             old: Arc::new(FrozenConv1d::new_from_conv1d(old)?),

@@ -65,13 +65,16 @@ impl LoraEmbedding {
         let embed_a = Embedding::new(a_t.clone(), a_t.dim(1)?);
 
         // Try to load magnitude vector for DoRA
-        let m = vb
-            .pp(format!("m{id}"))
-            .get(
-                (embed_config.embedding_dim, embed_config.num_embeddings),
-                "weight",
-            )
-            .ok();
+        let m: Option<Tensor> = if vb.contains_tensor(&format!("m{id}.weight")) {
+            vb.pp(format!("m{id}"))
+                .get(
+                    (embed_config.embedding_dim, embed_config.num_embeddings),
+                    "weight",
+                )
+                .ok()
+        } else {
+            None
+        };
 
         Ok(LoraEmbedding {
             old: Arc::new(FrozenEmbedding::new_from_embed(old)?),
