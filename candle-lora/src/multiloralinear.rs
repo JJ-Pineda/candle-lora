@@ -12,6 +12,7 @@ pub struct MultiLoraLinear {
     ff_b: HashMap<String, Linear>,
     scale: HashMap<String, Option<f64>>,
     m: HashMap<String, Option<Tensor>>, // DoRA magnitude vector
+    pub adapters: Vec<String>,
     active_adapter: Option<String>,
 }
 
@@ -48,12 +49,19 @@ impl MultiLoraLinear {
             )
         };
 
+        let adapters = if !a_map.is_empty() {
+            vec![config.name.clone()]
+        } else {
+            vec![]
+        };
+
         Ok(MultiLoraLinear {
             old: Arc::new(FrozenLinear::new_from_linear(old)?),
             ff_a: a_map,
             ff_b: b_map,
             scale: scale_map,
             m: m_map,
+            adapters,
             active_adapter,
         })
     }
@@ -82,26 +90,17 @@ impl MultiLoraLinear {
 
         let (a, b, m) = MultiLoraLinear::get_adapter_weights(linear_config, config, vb, id);
 
-        let a = match a {
-            Some(t) => Ok(Linear::new(t, None)),
-            None => Err(Error::Msg(
-                "Failed to extract lora A weights from varbuilder".to_string(),
-            )),
-        };
+        if a.is_some() && b.is_some() {
+            let scale = Some(config.alpha / config.rank as f64);
 
-        let b = match b {
-            Some(t) => Ok(Linear::new(t, None)),
-            None => Err(Error::Msg(
-                "Failed to extract lora B weights from varbuilder".to_string(),
-            )),
-        };
-
-        let scale = Some(config.alpha / config.rank as f64);
-
-        self.ff_a.insert(config.name.clone(), a?);
-        self.ff_b.insert(config.name.clone(), b?);
-        self.m.insert(config.name.clone(), m);
-        self.scale.insert(config.name.clone(), scale);
+            self.ff_a
+                .insert(config.name.clone(), Linear::new(a.unwrap(), None));
+            self.ff_b
+                .insert(config.name.clone(), Linear::new(b.unwrap(), None));
+            self.m.insert(config.name.clone(), m);
+            self.scale.insert(config.name.clone(), scale);
+            self.adapters.push(config.name.clone());
+        }
 
         Ok(())
     }
@@ -139,11 +138,12 @@ impl MultiLoraLinear {
         (a, b, m)
     }
 
-    fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
+    pub fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
         match adapter_name {
             Some(name) => {
-                if !self.ff_a.contains_key(name) {
-                    Err(Error::Msg(format!("Adapter '{}' does not exist!", name)))
+                if !self.adapters.contains(&name.to_string()) {
+                    self.active_adapter = None;
+                    Ok(())
                 } else {
                     self.active_adapter = Some(name.to_string());
                     Ok(())

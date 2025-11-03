@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{DType, Device, Error, Module, Result, Tensor};
 use candle_lora::{LoraConfig, LoraLinear, LoraLinearConfig, MultiLoraLinear};
 use candle_nn::{kv_cache::KvCache, Activation, VarBuilder};
 use std::sync::Arc;
@@ -51,7 +51,7 @@ impl Module for RmsNorm {
 }
 
 impl Qwen3RotaryEmbedding {
-    pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+    fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.head_dim;
         let max_seq_len = cfg.max_position_embeddings;
         let inv_freq: Vec<_> = (0..dim)
@@ -71,7 +71,7 @@ impl Qwen3RotaryEmbedding {
     }
 
     /// Apply RoPE (q, k shape: B x H x L x D)
-    pub(crate) fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?;
         let sin = self.sin.narrow(0, offset, seq_len)?;
@@ -82,15 +82,17 @@ impl Qwen3RotaryEmbedding {
 }
 
 #[derive(Debug)]
-pub(crate) struct Qwen3MLP {
-    gate_proj: LoraLinear,
-    up_proj: LoraLinear,
-    down_proj: LoraLinear,
+struct Qwen3MLP {
+    gate_proj: MultiLoraLinear,
+    up_proj: MultiLoraLinear,
+    down_proj: MultiLoraLinear,
     act_fn: Activation,
+    adapters: Vec<String>,
+    active_adapter: Option<String>,
 }
 
 impl Qwen3MLP {
-    fn new(cfg: &Config, vb: VarBuilder, lora_config: LoraConfig) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder, lora_config: &LoraConfig) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let intermediate_sz = cfg.intermediate_size;
 
@@ -99,7 +101,7 @@ impl Qwen3MLP {
         let gate_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
         let gate_proj_id = 0;
         let gate_proj_vb = vb.pp("gate_proj").pp("traced_lora_linear");
-        let gate_proj = LoraLinear::new(
+        let gate_proj = MultiLoraLinear::new(
             &gate_proj_base,
             &gate_proj_config,
             &lora_config,
@@ -110,7 +112,7 @@ impl Qwen3MLP {
         let up_proj_base = candle_nn::linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
         let up_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
         let up_proj_id = 0;
-        let up_proj = LoraLinear::new(
+        let up_proj = MultiLoraLinear::new(
             &up_proj_base,
             &up_proj_config,
             &lora_config,
@@ -122,19 +124,94 @@ impl Qwen3MLP {
             candle_nn::linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
         let down_proj_config = LoraLinearConfig::new(intermediate_sz, hidden_sz);
         let down_proj_id = 0;
-        let down_proj = LoraLinear::new(
+        let down_proj = MultiLoraLinear::new(
             &down_proj_base,
             &down_proj_config,
             &lora_config,
             &vb.pp("down_proj").pp("traced_lora_linear"),
             down_proj_id,
         )?;
+
+        // Verify whether gate, up, or down projection actually found an adapter
+        let (adapters, active_adapter) = if gate_proj.adapters.contains(&lora_config.name)
+            || up_proj.adapters.contains(&lora_config.name)
+            || down_proj.adapters.contains(&lora_config.name)
+        {
+            (
+                vec![lora_config.name.clone()],
+                Some(lora_config.name.clone()),
+            )
+        } else {
+            (vec![], None)
+        };
+
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
             act_fn: cfg.hidden_act,
+            adapters,
+            active_adapter,
         })
+    }
+
+    fn add_adapter(
+        &mut self,
+        cfg: &Config,
+        vb: VarBuilder,
+        lora_config: &LoraConfig,
+    ) -> Result<()> {
+        let hidden_sz = cfg.hidden_size;
+        let intermediate_sz = cfg.intermediate_size;
+
+        let gate_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
+        let gate_proj_id = 0;
+        let gate_proj_vb = vb.pp("gate_proj").pp("traced_lora_linear");
+        self.gate_proj
+            .add_adapter(&gate_proj_config, &lora_config, &gate_proj_vb, gate_proj_id)?;
+
+        let up_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
+        let up_proj_id = 0;
+        self.up_proj.add_adapter(
+            &up_proj_config,
+            &lora_config,
+            &vb.pp("up_proj").pp("traced_lora_linear"),
+            up_proj_id,
+        )?;
+
+        let down_proj_config = LoraLinearConfig::new(intermediate_sz, hidden_sz);
+        let down_proj_id = 0;
+        self.down_proj.add_adapter(
+            &down_proj_config,
+            &lora_config,
+            &vb.pp("down_proj").pp("traced_lora_linear"),
+            down_proj_id,
+        )?;
+
+        if self.gate_proj.adapters.contains(&lora_config.name)
+            || self.up_proj.adapters.contains(&lora_config.name)
+            || self.down_proj.adapters.contains(&lora_config.name)
+        {
+            self.adapters.push(lora_config.name.clone());
+        }
+
+        Ok(())
+    }
+
+    fn activate_adapter(&mut self, adapter_name: Option<&str>) {
+        let _ = self.gate_proj.activate_adapter(adapter_name);
+        let _ = self.up_proj.activate_adapter(adapter_name);
+        let _ = self.down_proj.activate_adapter(adapter_name);
+
+        if let Some(name) = adapter_name {
+            if self.adapters.contains(&name.to_string()) {
+                self.active_adapter = adapter_name.map(String::from);
+            } else {
+                self.active_adapter = None;
+            }
+        } else {
+            self.active_adapter = None;
+        }
     }
 }
 
@@ -147,12 +224,12 @@ impl Module for Qwen3MLP {
 }
 
 #[derive(Debug)]
-pub(crate) struct Qwen3Attention {
+struct Qwen3Attention {
     // projections
-    q_proj: LoraLinear,
-    k_proj: LoraLinear,
-    v_proj: LoraLinear,
-    o_proj: LoraLinear,
+    q_proj: MultiLoraLinear,
+    k_proj: MultiLoraLinear,
+    v_proj: MultiLoraLinear,
+    o_proj: MultiLoraLinear,
     // norms
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -165,14 +242,16 @@ pub(crate) struct Qwen3Attention {
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
     kv_cache: KvCache,
+    adapters: Vec<String>,
+    active_adapter: Option<String>,
 }
 
 impl Qwen3Attention {
-    pub(crate) fn new(
+    fn new(
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
-        lora_config: LoraConfig,
+        lora_config: &LoraConfig,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
             candle_core::bail!("sliding window is not supported")
@@ -189,7 +268,7 @@ impl Qwen3Attention {
         let q_proj_base = candle_nn::linear_no_bias(hidden_size, hidden_size, vb.pp("q_proj"))?;
         let q_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
         let q_proj_id = 0;
-        let q_proj = LoraLinear::new(
+        let q_proj = MultiLoraLinear::new(
             &q_proj_base,
             &q_proj_config,
             &lora_config,
@@ -201,7 +280,7 @@ impl Qwen3Attention {
             candle_nn::linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
         let k_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
         let k_proj_id = 0;
-        let k_proj = LoraLinear::new(
+        let k_proj = MultiLoraLinear::new(
             &k_proj_base,
             &k_proj_config,
             &lora_config,
@@ -213,7 +292,7 @@ impl Qwen3Attention {
             candle_nn::linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let v_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
         let v_proj_id = 0;
-        let v_proj = LoraLinear::new(
+        let v_proj = MultiLoraLinear::new(
             &v_proj_base,
             &v_proj_config,
             &lora_config,
@@ -224,13 +303,26 @@ impl Qwen3Attention {
         let o_proj_base = candle_nn::linear_no_bias(hidden_size, hidden_size, vb.pp("o_proj"))?;
         let o_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
         let o_proj_id = 0;
-        let o_proj = LoraLinear::new(
+        let o_proj = MultiLoraLinear::new(
             &o_proj_base,
             &o_proj_config,
             &lora_config,
             &vb.pp("o_proj").pp("traced_lora_linear"),
             o_proj_id,
         )?;
+
+        let (adapters, active_adapter) = if q_proj.adapters.contains(&lora_config.name)
+            || k_proj.adapters.contains(&lora_config.name)
+            || v_proj.adapters.contains(&lora_config.name)
+            || o_proj.adapters.contains(&lora_config.name)
+        {
+            (
+                vec![lora_config.name.clone()],
+                Some(lora_config.name.clone()),
+            )
+        } else {
+            (vec![], None)
+        };
 
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
@@ -253,11 +345,13 @@ impl Qwen3Attention {
             hidden_size,
             rotary_emb,
             kv_cache,
+            adapters,
+            active_adapter,
         })
     }
 
     /// Repeats a key or value tensor for grouped query attention
-    pub(crate) fn repeat_kv(&self, xs: Tensor, n_rep: usize) -> Result<Tensor> {
+    fn repeat_kv(&self, xs: Tensor, n_rep: usize) -> Result<Tensor> {
         if n_rep == 1 {
             Ok(xs)
         } else {
@@ -266,12 +360,88 @@ impl Qwen3Attention {
         }
     }
 
-    pub(crate) fn forward(
+    fn add_adapter(
         &mut self,
-        x: &Tensor,
-        attn_mask: Option<&Tensor>,
-        offset: usize,
-    ) -> Result<Tensor> {
+        cfg: &Config,
+        vb: VarBuilder,
+        lora_config: &LoraConfig,
+    ) -> Result<()> {
+        if cfg.use_sliding_window {
+            candle_core::bail!("sliding window is not supported")
+        }
+
+        let head_dim = cfg.head_dim;
+        let num_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads;
+
+        // Necessary because the hidden_size in the config isn't always accurate
+        let hidden_size = head_dim * num_heads;
+
+        let q_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
+        let q_proj_id = 0;
+        self.q_proj.add_adapter(
+            &q_proj_config,
+            &lora_config,
+            &vb.pp("q_proj").pp("traced_lora_linear"),
+            q_proj_id,
+        )?;
+
+        let k_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
+        let k_proj_id = 0;
+        self.k_proj.add_adapter(
+            &k_proj_config,
+            &lora_config,
+            &vb.pp("k_proj").pp("traced_lora_linear"),
+            k_proj_id,
+        )?;
+
+        let v_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
+        let v_proj_id = 0;
+        self.v_proj.add_adapter(
+            &v_proj_config,
+            &lora_config,
+            &vb.pp("v_proj").pp("traced_lora_linear"),
+            v_proj_id,
+        )?;
+
+        let o_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
+        let o_proj_id = 0;
+        self.o_proj.add_adapter(
+            &o_proj_config,
+            &lora_config,
+            &vb.pp("o_proj").pp("traced_lora_linear"),
+            o_proj_id,
+        )?;
+
+        if self.q_proj.adapters.contains(&lora_config.name)
+            || self.k_proj.adapters.contains(&lora_config.name)
+            || self.v_proj.adapters.contains(&lora_config.name)
+            || self.o_proj.adapters.contains(&lora_config.name)
+        {
+            self.adapters.push(lora_config.name.clone());
+        }
+
+        Ok(())
+    }
+
+    fn activate_adapter(&mut self, adapter_name: Option<&str>) {
+        let _ = self.q_proj.activate_adapter(adapter_name);
+        let _ = self.k_proj.activate_adapter(adapter_name);
+        let _ = self.v_proj.activate_adapter(adapter_name);
+        let _ = self.o_proj.activate_adapter(adapter_name);
+
+        if let Some(name) = adapter_name {
+            if self.adapters.contains(&name.to_string()) {
+                self.active_adapter = adapter_name.map(String::from);
+            } else {
+                self.active_adapter = None;
+            }
+        } else {
+            self.active_adapter = None;
+        }
+    }
+
+    fn forward(&mut self, x: &Tensor, attn_mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
         // 1. Proj
@@ -323,7 +493,7 @@ impl Qwen3Attention {
             .apply(&self.o_proj)
     }
 
-    pub(crate) fn clear_kv_cache(&mut self) {
+    fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
 }
@@ -334,6 +504,8 @@ pub struct DecoderLayer {
     mlp: Qwen3MLP,
     ln1: RmsNorm,
     ln2: RmsNorm,
+    adapters: Vec<String>,
+    active_adapter: Option<String>,
 }
 
 impl DecoderLayer {
@@ -341,9 +513,9 @@ impl DecoderLayer {
         rotary: Arc<Qwen3RotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
-        lora_config: LoraConfig,
+        lora_config: &LoraConfig,
     ) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(rotary, cfg, vb.pp("self_attn"), lora_config.clone())?;
+        let self_attn = Qwen3Attention::new(rotary, cfg, vb.pp("self_attn"), lora_config)?;
         let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"), lora_config)?;
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let ln2 = RmsNorm::new(
@@ -351,12 +523,57 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
+
+        let adapters = if self_attn.adapters.contains(&lora_config.name)
+            || mlp.adapters.contains(&lora_config.name)
+        {
+            vec![lora_config.name.clone()]
+        } else {
+            vec![]
+        };
+
         Ok(Self {
             self_attn,
             mlp,
             ln1,
             ln2,
+            adapters,
+            active_adapter: Some(lora_config.name.clone()),
         })
+    }
+
+    fn add_adapter(
+        &mut self,
+        cfg: &Config,
+        vb: &VarBuilder,
+        lora_config: &LoraConfig,
+    ) -> Result<()> {
+        self.self_attn
+            .add_adapter(cfg, vb.pp("self_attn"), lora_config)?;
+        self.mlp.add_adapter(cfg, vb.pp("mlp"), lora_config)?;
+
+        if self.self_attn.adapters.contains(&lora_config.name)
+            || self.mlp.adapters.contains(&lora_config.name)
+        {
+            self.adapters.push(lora_config.name.clone());
+            Ok(())
+        } else {
+            Err(Error::Msg("No LoRA weights detected!".to_string()))
+        }
+    }
+
+    fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
+        if let Some(name) = adapter_name {
+            if !self.adapters.contains(&name.to_string()) {
+                return Err(Error::Msg(format!("Adapter '{}' does not exist!", name)));
+            }
+        }
+
+        let _ = self.self_attn.activate_adapter(adapter_name);
+        let _ = self.mlp.activate_adapter(adapter_name);
+        self.active_adapter = adapter_name.map(String::from);
+
+        Ok(())
     }
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
@@ -380,6 +597,8 @@ pub struct Model {
     norm: RmsNorm,
     device: Device,
     dtype: DType,
+    adapters: Vec<String>,
+    active_adapter: Option<String>,
 }
 
 impl Model {
@@ -394,15 +613,24 @@ impl Model {
                 rotary.clone(),
                 cfg,
                 vb_l.pp(i),
-                lora_config.clone(),
+                &lora_config,
             )?);
         }
+
+        let adapters = if layers[0].adapters.contains(&lora_config.name) {
+            vec![lora_config.name.clone()]
+        } else {
+            vec![]
+        };
+
         Ok(Self {
             embed_tokens,
             layers,
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            adapters,
+            active_adapter: Some(lora_config.name.clone()),
         })
     }
 
@@ -437,6 +665,34 @@ impl Model {
             })
             .collect();
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+    }
+
+    fn add_adapter(
+        &mut self,
+        cfg: &Config,
+        vb: VarBuilder,
+        lora_config: &LoraConfig,
+    ) -> Result<()> {
+        let vb_l = vb.pp("model.layers");
+        for i in 0..cfg.num_hidden_layers {
+            self.layers[i].add_adapter(cfg, &vb_l.pp(i), lora_config)?;
+        }
+
+        if self.layers[0].adapters.contains(&lora_config.name) {
+            self.adapters.push(lora_config.name.clone());
+            Ok(())
+        } else {
+            Err(Error::Msg("No LoRA weights detected!".to_string()))
+        }
+    }
+
+    fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
+        self.active_adapter = adapter_name.map(String::from);
+        for i in 0..self.layers.len() {
+            let _ = self.layers[i].activate_adapter(adapter_name)?;
+        }
+
+        Ok(())
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {

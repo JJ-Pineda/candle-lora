@@ -107,7 +107,7 @@ pub struct LoraConfig {
     rank: usize,
     alpha: f64,
     dropout: Option<f32>,
-    name: String,
+    pub name: String,
 }
 
 impl LoraConfig {
