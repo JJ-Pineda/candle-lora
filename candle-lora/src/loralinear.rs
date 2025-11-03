@@ -25,8 +25,8 @@ pub struct LoraLinear {
 #[derive(Clone, Debug)]
 /// Configuration for LoraLinear
 pub struct LoraLinearConfig {
-    in_features: usize,
-    out_features: usize,
+    pub(crate) in_features: usize,
+    pub(crate) out_features: usize,
 }
 
 impl LoraLinearConfig {
@@ -168,7 +168,6 @@ impl Module for LoraLinear {
         if self.merged {
             self.old.forward(input)
         } else {
-            //No fan_in_fan_out so no weight.transpose(0,1)
             let mut result = self.old.forward(input)?;
             if let Some(scale) = self.scale {
                 let input_new = if self.dropout.is_some() {

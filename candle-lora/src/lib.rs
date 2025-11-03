@@ -107,6 +107,7 @@ pub struct LoraConfig {
     rank: usize,
     alpha: f64,
     dropout: Option<f32>,
+    name: String,
 }
 
 impl LoraConfig {
@@ -114,11 +115,21 @@ impl LoraConfig {
     /// - `rank`: The dimensions of low-rank matrices.
     /// - `alpha`: Scaling factor for the LoRA signal.
     /// - `dropout`: Dropout probability for the LoRA layers.
-    pub const fn new(rank: usize, alpha: f64, dropout: Option<f32>) -> Self {
+    pub fn new(rank: usize, alpha: f64, dropout: Option<f32>) -> Self {
         Self {
             rank,
             alpha,
             dropout,
+            name: "lora0".to_string(),
+        }
+    }
+
+    pub fn new_with_name(rank: usize, alpha: f64, dropout: Option<f32>, name: &str) -> Self {
+        Self {
+            rank,
+            alpha,
+            dropout,
+            name: name.to_string(),
         }
     }
 }
