@@ -1,6 +1,6 @@
 use candle_core::{DType, Device, Error, Module, Result, Tensor};
-use candle_lora::{LoraConfig, LoraLinear, LoraLinearConfig, MultiLoraLinear};
-use candle_nn::{kv_cache::KvCache, Activation, VarBuilder};
+use candle_lora::{LoraConfig, LoraLinearConfig, MultiLoraLinear};
+use candle_nn::{kv_cache::KvCache, linear_no_bias, Activation, Linear, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -100,12 +100,11 @@ impl Qwen3MLP {
             candle_nn::linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
         let gate_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
         let gate_proj_id = 0;
-        let gate_proj_vb = vb.pp("gate_proj").pp("traced_lora_linear");
         let gate_proj = MultiLoraLinear::new(
             &gate_proj_base,
             &gate_proj_config,
             &lora_config,
-            &gate_proj_vb,
+            &vb.pp("gate_proj.lora_linear"),
             gate_proj_id,
         )?;
 
@@ -116,7 +115,7 @@ impl Qwen3MLP {
             &up_proj_base,
             &up_proj_config,
             &lora_config,
-            &vb.pp("up_proj").pp("traced_lora_linear"),
+            &vb.pp("up_proj.lora_linear"),
             up_proj_id,
         )?;
 
@@ -128,7 +127,7 @@ impl Qwen3MLP {
             &down_proj_base,
             &down_proj_config,
             &lora_config,
-            &vb.pp("down_proj").pp("traced_lora_linear"),
+            &vb.pp("down_proj.lora_linear"),
             down_proj_id,
         )?;
 
@@ -166,16 +165,19 @@ impl Qwen3MLP {
 
         let gate_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
         let gate_proj_id = 0;
-        let gate_proj_vb = vb.pp("gate_proj").pp("traced_lora_linear");
-        self.gate_proj
-            .add_adapter(&gate_proj_config, &lora_config, &gate_proj_vb, gate_proj_id)?;
+        self.gate_proj.add_adapter(
+            &gate_proj_config,
+            &lora_config,
+            &vb.pp("gate_proj.lora_linear"),
+            gate_proj_id,
+        )?;
 
         let up_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
         let up_proj_id = 0;
         self.up_proj.add_adapter(
             &up_proj_config,
             &lora_config,
-            &vb.pp("up_proj").pp("traced_lora_linear"),
+            &vb.pp("up_proj.lora_linear"),
             up_proj_id,
         )?;
 
@@ -184,7 +186,7 @@ impl Qwen3MLP {
         self.down_proj.add_adapter(
             &down_proj_config,
             &lora_config,
-            &vb.pp("down_proj").pp("traced_lora_linear"),
+            &vb.pp("down_proj.lora_linear"),
             down_proj_id,
         )?;
 
@@ -272,7 +274,7 @@ impl Qwen3Attention {
             &q_proj_base,
             &q_proj_config,
             &lora_config,
-            &vb.pp("q_proj").pp("traced_lora_linear"),
+            &vb.pp("q_proj.lora_linear"),
             q_proj_id,
         )?;
 
@@ -284,7 +286,7 @@ impl Qwen3Attention {
             &k_proj_base,
             &k_proj_config,
             &lora_config,
-            &vb.pp("k_proj").pp("traced_lora_linear"),
+            &vb.pp("k_proj.lora_linear"),
             k_proj_id,
         )?;
 
@@ -296,7 +298,7 @@ impl Qwen3Attention {
             &v_proj_base,
             &v_proj_config,
             &lora_config,
-            &vb.pp("v_proj").pp("traced_lora_linear"),
+            &vb.pp("v_proj.lora_linear"),
             v_proj_id,
         )?;
 
@@ -307,7 +309,7 @@ impl Qwen3Attention {
             &o_proj_base,
             &o_proj_config,
             &lora_config,
-            &vb.pp("o_proj").pp("traced_lora_linear"),
+            &vb.pp("o_proj.lora_linear"),
             o_proj_id,
         )?;
 
@@ -382,7 +384,7 @@ impl Qwen3Attention {
         self.q_proj.add_adapter(
             &q_proj_config,
             &lora_config,
-            &vb.pp("q_proj").pp("traced_lora_linear"),
+            &vb.pp("q_proj.lora_linear"),
             q_proj_id,
         )?;
 
@@ -391,7 +393,7 @@ impl Qwen3Attention {
         self.k_proj.add_adapter(
             &k_proj_config,
             &lora_config,
-            &vb.pp("k_proj").pp("traced_lora_linear"),
+            &vb.pp("k_proj.lora_linear"),
             k_proj_id,
         )?;
 
@@ -400,7 +402,7 @@ impl Qwen3Attention {
         self.v_proj.add_adapter(
             &v_proj_config,
             &lora_config,
-            &vb.pp("v_proj").pp("traced_lora_linear"),
+            &vb.pp("v_proj.lora_linear"),
             v_proj_id,
         )?;
 
@@ -409,7 +411,7 @@ impl Qwen3Attention {
         self.o_proj.add_adapter(
             &o_proj_config,
             &lora_config,
-            &vb.pp("o_proj").pp("traced_lora_linear"),
+            &vb.pp("o_proj.lora_linear"),
             o_proj_id,
         )?;
 
@@ -604,10 +606,10 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder, lora_config: LoraConfig) -> Result<Self> {
         let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb.pp("model.layers");
+        let vb_l = vb.pp("layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(
                 rotary.clone(),
@@ -715,35 +717,16 @@ impl Model {
 #[derive(Debug)]
 pub struct ModelForCausalLM {
     pub base: Model,
-    lm_head: LoraLinear,
+    lm_head: Linear,
 }
 
 impl ModelForCausalLM {
     pub fn new(cfg: &Config, vb: VarBuilder, lora_config: LoraConfig) -> Result<Self> {
-        let base = Model::new(cfg, vb.clone(), lora_config.clone())?;
+        let base = Model::new(cfg, vb.pp("model"), lora_config.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
-            let lm_head_base = candle_nn::Linear::new(base.embed_tokens.embeddings().clone(), None);
-            let lm_head_config = LoraLinearConfig::new(cfg.hidden_size, cfg.vocab_size);
-            let lm_head_id = 0;
-            LoraLinear::new(
-                &lm_head_base,
-                &lm_head_config,
-                &lora_config,
-                &vb.pp("lm_head").pp("traced_lora_linear"),
-                lm_head_id,
-            )?
+            Linear::new(base.embed_tokens.embeddings().clone(), None)
         } else {
-            let lm_head_base =
-                candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
-            let lm_head_config = LoraLinearConfig::new(cfg.hidden_size, cfg.vocab_size);
-            let lm_head_id = 0;
-            LoraLinear::new(
-                &lm_head_base,
-                &lm_head_config,
-                &lora_config,
-                &vb.pp("lm_head").pp("traced_lora_linear"),
-                lm_head_id,
-            )?
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         Ok(Self { base, lm_head })
     }

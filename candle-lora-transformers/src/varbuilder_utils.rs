@@ -55,11 +55,11 @@ fn verify_name(name: &str) -> String {
     };
     //model.layers.0.mlp.up_proj.lora_A.weight
     let new_name = if let Some(bp) = name.strip_suffix(".lora_A.weight") {
-        format!("{bp}.traced_lora_linear.a0.weight")
+        format!("{bp}.lora_linear.a0.weight")
     } else if let Some(bp) = name.strip_suffix(".lora_B.weight") {
-        format!("{bp}.traced_lora_linear.b0.weight")
+        format!("{bp}.lora_linear.b0.weight")
     } else if let Some(bp) = name.strip_suffix(".lora_magnitude_vector") {
-        format!("{bp}.traced_lora_linear.m0.weight")
+        format!("{bp}.lora_linear.m0.weight")
     } else {
         name.to_string()
     };
