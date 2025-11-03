@@ -597,8 +597,8 @@ pub struct Model {
     norm: RmsNorm,
     device: Device,
     dtype: DType,
-    adapters: Vec<String>,
-    active_adapter: Option<String>,
+    pub adapters: Vec<String>,
+    pub active_adapter: Option<String>,
 }
 
 impl Model {
@@ -746,6 +746,21 @@ impl ModelForCausalLM {
             )?
         };
         Ok(Self { base, lm_head })
+    }
+
+    pub fn add_adapter(
+        &mut self,
+        cfg: &Config,
+        vb: VarBuilder,
+        lora_config: &LoraConfig,
+    ) -> Result<()> {
+        let _ = self.base.add_adapter(cfg, vb, lora_config)?;
+        Ok(())
+    }
+
+    pub fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
+        let _ = self.base.activate_adapter(adapter_name);
+        Ok(())
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {

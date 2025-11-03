@@ -82,7 +82,7 @@ impl MultiLoraLinear {
         }
 
         // Rank must be 1 or more
-        if config.rank >= 1 {
+        if config.rank < 1 {
             return Err(Error::Msg(
                 "Adapter rank must be greater than or equal to 1!".to_string(),
             ));
