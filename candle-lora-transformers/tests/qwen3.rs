@@ -88,16 +88,11 @@ fn test_qwen3() -> Result<()> {
         .into_iter()
         .map(|m| {
             let prompt = build_prompt(m);
-            let enc = tokenizer
-                .encode(prompt, true)
-                .map_err(anyhow::Error::from)?
+            let enc = tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?;
             Ok(enc.get_ids().to_vec())
         })
         .collect::<Result<Vec<_>>>()?;
-    let ids = ids_vec
-        .into_iter()
-        .map(|v| v.as_slice())
-        .collect::<Vec<_>>();
+    let ids: Vec<&[u32]> = ids_vec.iter().map(|v| v.as_slice()).collect();
 
     let logits_base = run_logits(&mut model, ids[0], &device)?.to_dtype(DType::F32)?;
 
@@ -119,14 +114,19 @@ fn test_qwen3() -> Result<()> {
 
     // --- Test generation
     let output_ids = model.generate(&ids, Some(0.7), Some(0.9), Some(10), None)?;
-    let generated_text = tokens_to_string(&tokenizer, &output_ids[0])?.unwrap();
 
-    anyhow::ensure!(
-        generated_text.trim().len() >= 1,
-        "Model produced empty output text."
-    );
+    // Verify both sequences generated output
+    anyhow::ensure!(output_ids.len() == 2, "Expected 2 generated sequences");
 
-    println!("{}", generated_text);
+    for (i, output) in output_ids.iter().enumerate() {
+        let generated_text = tokens_to_string(&tokenizer, output)?.unwrap();
+        anyhow::ensure!(
+            generated_text.trim().len() >= 1,
+            "Model produced empty output text for sequence {}",
+            i
+        );
+        println!("Sequence {}: {}", i, generated_text);
+    }
 
     Ok(())
 }

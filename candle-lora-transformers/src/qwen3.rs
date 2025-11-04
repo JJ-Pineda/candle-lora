@@ -681,18 +681,29 @@ impl Model {
         let mut causal_mask = self.causal_mask(b, tgt, offset, None)?;
 
         if let Some(pad_mask) = padding_mask {
-            // pad_mask shape: [b, tgt + offset] where 1 = valid, 0 = padding
-            // We need to broadcast it to [b, 1, tgt, tgt + offset] and mask padding positions
-            let pad_mask = pad_mask
-                .unsqueeze(1)? // [b, 1, tgt + offset]
-                .unsqueeze(1)? // [b, 1, 1, tgt + offset]
+            // pad_mask shape: [b, seq_len] where 1 = valid, 0 = padding
+            // We want valid queries to NOT attend to padding keys
+            // But padding queries can attend to padding (they're ignored anyway)
+
+            // Query mask: [b, 1, seq_len, 1] - which queries are valid
+            let query_mask = pad_mask
+                .unsqueeze(1)? // [b, 1, seq_len]
+                .unsqueeze(3)?; // [b, 1, seq_len, 1]
+
+            // Key mask: [b, 1, 1, seq_len] - which keys are valid
+            let key_mask = pad_mask
+                .unsqueeze(1)? // [b, 1, seq_len]
+                .unsqueeze(1)?; // [b, 1, 1, seq_len]
+
+            // Only mask if query is valid AND key is padding
+            // valid_query (1) attending to padding_key (0) should be masked
+            let inverted_key_mask = key_mask
+                .affine(-1.0, 1.0)?
                 .broadcast_as(causal_mask.shape())?;
+            let query_mask_broadcast = query_mask.broadcast_as(causal_mask.shape())?;
+            let should_mask = (query_mask_broadcast * inverted_key_mask)?;
 
-            // Where pad_mask is 0 (padding), set attention to -inf
-            // Convert: 1 (valid) -> 0, 0 (padding) -> -inf
-            let inverted = pad_mask.affine(-1.0, 1.0)?; // 1 -> 0, 0 -> 1
-            let padding_penalty = inverted.affine(minf as f64, 0.0)?.to_dtype(self.dtype)?;
-
+            let padding_penalty = should_mask.affine(minf as f64, 0.0)?.to_dtype(self.dtype)?;
             causal_mask = (causal_mask + padding_penalty)?;
         }
 
@@ -814,42 +825,6 @@ impl ModelForCausalLM {
         (*guard).clear_kv_cache();
     }
 
-    /// Creates a padding mask for the first generation step if needed.
-    /// Returns None if there's no padding in the batch.
-    fn create_padding_mask(
-        &self,
-        continue_rows: &[usize],
-        padding_lengths: &[usize],
-        cols: usize,
-        device: &Device,
-    ) -> Result<Option<Tensor>> {
-        let has_padding = continue_rows.iter().any(|&r| padding_lengths[r] > 0);
-
-        if !has_padding {
-            return Ok(None);
-        }
-
-        // Create a mask tensor: 1 for valid tokens, 0 for padding
-        let mask_data: Vec<f32> = continue_rows
-            .iter()
-            .flat_map(|&r| {
-                let pad_len = padding_lengths[r];
-                let valid_len = cols - pad_len;
-                // Left padding: pad_len zeros, then valid_len ones
-                std::iter::repeat(0.0f32)
-                    .take(pad_len)
-                    .chain(std::iter::repeat(1.0f32).take(valid_len))
-            })
-            .collect();
-
-        Ok(Some(Tensor::from_vec(
-            mask_data,
-            (continue_rows.len(), cols),
-            device,
-        )?))
-    }
-
-    /// Removes padding tokens from generated sequences.
     fn strip_padding(&self, ids: Vec<Vec<u32>>, padding_token_id: u32) -> Vec<Vec<u32>> {
         ids.iter()
             .map(|v| {
@@ -897,20 +872,14 @@ impl ModelForCausalLM {
         // Pad input sequences to same length
         let rows = input_ids.len();
         let cols = input_ids.iter().map(|r| r.len()).max().unwrap_or(0);
-        let (mut ids, padding_lengths) = {
-            let mut padded = Vec::with_capacity(rows);
-            let mut pad_lens = Vec::with_capacity(rows);
-
-            for seq in input_ids.iter() {
-                let pad_len = cols - seq.len();
-                pad_lens.push(pad_len);
-
-                let mut padded_seq = vec![padding_token_id; pad_len];
+        let mut ids = input_ids
+            .iter()
+            .map(|seq| {
+                let mut padded_seq = vec![padding_token_id; cols - seq.len()];
                 padded_seq.extend(*seq);
-                padded.push(padded_seq);
-            }
-            (padded, pad_lens)
-        };
+                padded_seq
+            })
+            .collect::<Vec<_>>();
 
         // Initialize generation state
         let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
@@ -918,7 +887,6 @@ impl ModelForCausalLM {
         self.clear_kv_cache();
 
         // Generation loop
-        println!("Starting generation");
         for step in 0..max_tokens {
             // Get rows still generating
             let continue_rows: Vec<usize> = (0..rows).filter(|i| !done_rows.contains(i)).collect();
@@ -945,12 +913,10 @@ impl ModelForCausalLM {
 
             let input = Tensor::new(ctx, &device)?;
 
-            // Create padding mask only for first step if needed
-            let padding_mask = if step == 0 {
-                self.create_padding_mask(&continue_rows, &padding_lengths, cols, &device)?
-            } else {
-                None
-            };
+            // Note: With left-padding, we don't actually need padding masks for generation
+            // because we only sample from the last token position, which is always valid.
+            // The padding tokens' hidden states are never used for generation.
+            let padding_mask = None;
 
             // Forward pass
             let logits = self
