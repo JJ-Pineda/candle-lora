@@ -3,7 +3,6 @@ use candle_lora::{LoraConfig, LoraLinearConfig, MultiLoraLinear};
 use candle_nn::{kv_cache::KvCache, linear_no_bias, Activation, Linear, VarBuilder};
 use candle_transformers::generation::LogitsProcessor;
 use std::sync::{Arc, RwLock};
-use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -793,7 +792,6 @@ impl ModelForCausalLM {
     pub fn generate(
         &mut self,
         input_ids: &[&[u32]],
-        tokenizer: &Tokenizer,
         temperature: Option<f64>,
         top_p: Option<f64>,
         max_new_tokens: Option<u32>,
@@ -804,59 +802,93 @@ impl ModelForCausalLM {
 
         // To-do: need to introduce padding and make the block below vectorized
         let rows = input_ids.len();
-        let cols = input_ids.first().map_or(0, |r| r.len());
-        assert!(
-            input_ids.iter().all(|r| r.len() == cols),
-            "Tensors must be square"
-        );
+        let cols = input_ids.iter().map(|r| r.len()).max().unwrap_or(0);
 
-        // let flat: Vec<u32> = input_ids.iter().flat_map(|r| r.iter().copied()).collect();
-        // let input_tensor = Tensor::from_vec(flat, (rows, cols), device);
+        // Taken from unsloth's Qwen3 "generation_config.json"
+        let eos_token_id: u32 = 151643;
+        let padding_token_id: u32 = 151654;
 
-        // let input_tensor = Tensor::new(input_ids, &(*guard).device)?;
-        // let (_, l) = input_tensor.dims2()?;
+        let mut padded_input_ids: Vec<Vec<u32>> = Vec::with_capacity(rows);
 
-        // let logits = self
-        //     .base
-        //     .forward(input_tensor, 0)?
-        //     .narrow(1, l - 1, 1)?
-        //     .apply(&self.lm_head)?
-        //     .to_dtype(DType::F32)?;
+        let _ = input_ids.iter().enumerate().map(|(i, &v)| {
+            let padding = vec![padding_token_id; cols - v.len()];
+            padded_input_ids[i].extend(padding);
+            padded_input_ids[i].extend(v);
+        });
 
-        // let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
+        let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
 
-        // let eos_id = tokenizer
-        //     .get_vocab(true)
-        //     .get("<|endoftext|>")
-        //     .copied()
-        //     .unwrap_or_else(|| {
-        //         println!("Could not find EOS token!");
-        //         u32::MAX
-        //     });
+        let mut ids = padded_input_ids
+            .iter()
+            .map(|v| v.to_vec())
+            .collect::<Vec<Vec<u32>>>();
 
-        // let mut generated_text = String::new();
-        // for step in 0..max_new_tokens {
-        //     // Only feed the full context once; then one token at a time using KV-cache.
-        //     let ctx_len = if step == 0 { ids.len() } else { 1 };
-        //     let start_pos = ids.len().saturating_sub(ctx_len);
-        //     let ctx = &ids[start_pos..];
+        let mut done_rows: Vec<usize> = vec![];
+        let mut guard = self.base.write().unwrap();
+        guard.clear_kv_cache();
 
-        //     let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
-        //     let logits = model
-        //         .forward(&input, start_pos)?
-        //         .squeeze(0)?
-        //         .squeeze(0)?
-        //         .to_dtype(DType::F32)?;
+        println!("Starting generation");
+        for step in 0..max_new_tokens.unwrap_or(512) {
+            // Remove rows we are done with
+            let continue_rows = (0..rows)
+                .filter_map(|i| {
+                    if done_rows.contains(&i) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
 
-        //     // Clear KV cache
-        //     model.clear_kv_cache();
+            let continue_ids = continue_rows
+                .iter()
+                .map(|&i| ids[i].clone())
+                .collect::<Vec<_>>();
 
-        //     let next_id = lp.sample(&logits).context("sampling")?;
-        //     ids.push(next_id);
-        //     if next_id == eos_id {
-        //         break;
-        //     }
+            // Only feed the full context once; then one token at a time using KV-cache.
+            let ctx_len = if step == 0 { cols } else { 1 };
+            let start_pos = cols.saturating_sub(ctx_len);
+            let ctx = continue_ids
+                .iter()
+                .map(|r| &r[start_pos..])
+                .collect::<Vec<_>>();
 
-        Ok(vec![vec![]])
+            let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
+            let logits = guard
+                .forward(&input, start_pos)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?;
+
+            for r in 0..rows {
+                if !done_rows.contains(&r) {
+                    let next_id = lp.sample(&logits.get(r)?)?;
+                    ids[r].push(next_id);
+
+                    if next_id == eos_token_id {
+                        done_rows.push(r);
+                    }
+                }
+            }
+        }
+
+        // Strip padding
+        let depadded = ids
+            .iter()
+            .map(|v| {
+                v.iter()
+                    .filter_map(|&id| {
+                        if id == padding_token_id {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        guard.clear_kv_cache();
+        Ok(depadded)
     }
 }

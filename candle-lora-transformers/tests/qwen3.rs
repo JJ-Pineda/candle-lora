@@ -40,12 +40,12 @@ fn run_logits(model: &mut ModelForCausalLM, input_ids: &[u32], device: &Device) 
     Ok(logits)
 }
 
-fn token_to_string(tokenizer: &Tokenizer, id: u32) -> Result<Option<String>> {
+fn tokens_to_string(tokenizer: &Tokenizer, ids: &[u32]) -> Result<Option<String>> {
     // Many tokenizers can decode one id at a time, but some BPEs produce
     // leading spaces/special joins. This is fine for a test; we only need
     // a minimal check that it resembles text.
     let s = tokenizer
-        .decode(&[id], /*skip_special_tokens=*/ true)
+        .decode(ids, /*skip_special_tokens=*/ true)
         .map_err(anyhow::Error::msg)?;
     if s.is_empty() {
         Ok(None)
@@ -82,7 +82,7 @@ fn test_qwen3() -> Result<()> {
     // --- Tiny generation loop (greedy / top-p+temp) ---
     let prompt =
         "<|im_start|>user\n\nHello, who are you?\n\n<|im_start|>assistant\n\n<think>\n\n</think>";
-    let mut ids = tokenizer
+    let ids = tokenizer
         .encode(prompt, true)
         .map_err(anyhow::Error::msg)?
         .get_ids()
@@ -106,57 +106,10 @@ fn test_qwen3() -> Result<()> {
 
     assert_ne!(diff, 0f32);
 
-    // --- Tiny generation loop (greedy / top-p+temp) ---
-    // Small, deterministic settings for testability.
-    let seed: u64 = 42;
-    let temperature: Option<f64> = Some(0.7);
-    let top_p: Option<f64> = Some(0.9);
-    let mut lp = LogitsProcessor::new(seed, temperature, top_p);
+    // --- Test generation
+    let output_ids = model.generate(&[&ids], Some(0.7), Some(0.9), Some(10), None)?;
+    let generated_text = tokens_to_string(&tokenizer, &output_ids[0])?.unwrap();
 
-    let eos_id = tokenizer
-        .get_vocab(true)
-        .get("<|endoftext|>")
-        .copied()
-        .unwrap_or_else(|| {
-            println!("Could not find EOS token!");
-            u32::MAX
-        });
-
-    let max_new_tokens = 10usize; // keep short for test runtime
-    let mut generated_text = String::new();
-
-    println!("Starting generation loop...");
-    for step in 0..max_new_tokens {
-        // Only feed the full context once; then one token at a time using KV-cache.
-        let ctx_len = if step == 0 { ids.len() } else { 1 };
-        let start_pos = ids.len().saturating_sub(ctx_len);
-        let ctx = &ids[start_pos..];
-
-        let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
-        let logits = model
-            .forward(&input, start_pos)
-            .context("forward pass")?
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_dtype(DType::F32)?;
-
-        let next_id = lp.sample(&logits).context("sampling")?;
-        ids.push(next_id);
-        if next_id == eos_id {
-            break;
-        }
-
-        // Best-effort incremental decode
-        if let Some(tok) = token_to_string(&tokenizer, next_id)? {
-            generated_text.push_str(&tok);
-        }
-    }
-
-    // Clear KV cache
-    model.clear_kv_cache();
-
-    // --- Basic assertions ---
-    // Ensure we *actually* produced something beyond the prompt.
     anyhow::ensure!(
         generated_text.trim().len() >= 1,
         "Model produced empty output text."
