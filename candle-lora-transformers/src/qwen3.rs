@@ -1,7 +1,9 @@
 use candle_core::{DType, Device, Error, Module, Result, Tensor};
 use candle_lora::{LoraConfig, LoraLinearConfig, MultiLoraLinear};
 use candle_nn::{kv_cache::KvCache, linear_no_bias, Activation, Linear, VarBuilder};
-use std::sync::Arc;
+use candle_transformers::generation::LogitsProcessor;
+use std::sync::{Arc, RwLock};
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -716,7 +718,7 @@ impl Model {
 
 #[derive(Debug)]
 pub struct ModelForCausalLM {
-    pub base: Model,
+    pub base: Arc<RwLock<Model>>,
     lm_head: Linear,
 }
 
@@ -728,7 +730,25 @@ impl ModelForCausalLM {
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
-        Ok(Self { base, lm_head })
+
+        Ok(Self {
+            base: Arc::new(RwLock::new(base)),
+            lm_head,
+        })
+    }
+
+    pub fn from_base(base: Arc<RwLock<Model>>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let guard = base.read().unwrap();
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new((*guard).embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        };
+
+        Ok(Self {
+            base: Arc::clone(&base),
+            lm_head,
+        })
     }
 
     pub fn add_adapter(
@@ -737,24 +757,98 @@ impl ModelForCausalLM {
         vb: VarBuilder,
         lora_config: &LoraConfig,
     ) -> Result<()> {
-        let _ = self.base.add_adapter(cfg, vb, lora_config)?;
+        let mut guard = self.base.write().unwrap();
+        let _ = (*guard).add_adapter(cfg, vb, lora_config)?;
         Ok(())
     }
 
     pub fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
-        let _ = self.base.activate_adapter(adapter_name);
+        let mut guard = self.base.write().unwrap();
+        let _ = (*guard).activate_adapter(adapter_name);
         Ok(())
     }
 
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn clear_kv_cache(&mut self) {
+        let mut guard = self.base.write().unwrap();
+        (*guard).clear_kv_cache();
+    }
+
+    pub fn forward(&self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
-        self.base
+        let mut guard = self.base.write().unwrap();
+        (*guard)
             .forward(input, offset)?
             .narrow(1, l - 1, 1)?
             .apply(&self.lm_head)
     }
 
-    pub fn clear_kv_cache(&mut self) {
-        self.base.clear_kv_cache();
+    pub fn generate(
+        &mut self,
+        input_ids: &[&[u32]],
+        tokenizer: &Tokenizer,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        max_new_tokens: Option<u32>,
+        seed: Option<u64>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let guard = self.base.read().unwrap();
+        let device = &(*guard).device;
+
+        // To-do: need to introduce padding and make the block below vectorized
+        let rows = input_ids.len();
+        let cols = input_ids.first().map_or(0, |r| r.len());
+        assert!(
+            input_ids.iter().all(|r| r.len() == cols),
+            "Tensors must be square"
+        );
+
+        // let flat: Vec<u32> = input_ids.iter().flat_map(|r| r.iter().copied()).collect();
+        // let input_tensor = Tensor::from_vec(flat, (rows, cols), device);
+
+        // let input_tensor = Tensor::new(input_ids, &(*guard).device)?;
+        // let (_, l) = input_tensor.dims2()?;
+
+        // let logits = self
+        //     .base
+        //     .forward(input_tensor, 0)?
+        //     .narrow(1, l - 1, 1)?
+        //     .apply(&self.lm_head)?
+        //     .to_dtype(DType::F32)?;
+
+        // let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
+
+        // let eos_id = tokenizer
+        //     .get_vocab(true)
+        //     .get("<|endoftext|>")
+        //     .copied()
+        //     .unwrap_or_else(|| {
+        //         println!("Could not find EOS token!");
+        //         u32::MAX
+        //     });
+
+        // let mut generated_text = String::new();
+        // for step in 0..max_new_tokens {
+        //     // Only feed the full context once; then one token at a time using KV-cache.
+        //     let ctx_len = if step == 0 { ids.len() } else { 1 };
+        //     let start_pos = ids.len().saturating_sub(ctx_len);
+        //     let ctx = &ids[start_pos..];
+
+        //     let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
+        //     let logits = model
+        //         .forward(&input, start_pos)?
+        //         .squeeze(0)?
+        //         .squeeze(0)?
+        //         .to_dtype(DType::F32)?;
+
+        //     // Clear KV cache
+        //     model.clear_kv_cache();
+
+        //     let next_id = lp.sample(&logits).context("sampling")?;
+        //     ids.push(next_id);
+        //     if next_id == eos_id {
+        //         break;
+        //     }
+
+        Ok(vec![vec![]])
     }
 }
