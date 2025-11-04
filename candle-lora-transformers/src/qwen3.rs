@@ -901,12 +901,12 @@ impl ModelForCausalLM {
             let mut padded = Vec::with_capacity(rows);
             let mut pad_lens = Vec::with_capacity(rows);
 
-            for &seq in input_ids.iter() {
+            for seq in input_ids.iter() {
                 let pad_len = cols - seq.len();
                 pad_lens.push(pad_len);
 
                 let mut padded_seq = vec![padding_token_id; pad_len];
-                padded_seq.extend(seq);
+                padded_seq.extend(*seq);
                 padded.push(padded_seq);
             }
             (padded, pad_lens)

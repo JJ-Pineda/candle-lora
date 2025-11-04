@@ -39,6 +39,10 @@ fn run_logits(model: &mut ModelForCausalLM, input_ids: &[u32], device: &Device) 
     Ok(logits)
 }
 
+fn build_prompt(msg: &str) -> String {
+    format!("<|im_start|>user\n\n{msg}\n\n<|im_start|>assistant\n\n<think>\n\n</think>")
+}
+
 fn tokens_to_string(tokenizer: &Tokenizer, ids: &[u32]) -> Result<Option<String>> {
     // Many tokenizers can decode one id at a time, but some BPEs produce
     // leading spaces/special joins. This is fine for a test; we only need
@@ -79,15 +83,23 @@ fn test_qwen3() -> Result<()> {
     let mut model = ModelForCausalLM::from_base(Arc::clone(&model), &cfg, vb)?;
 
     // --- Tiny generation loop (greedy / top-p+temp) ---
-    let prompt =
-        "<|im_start|>user\n\nHello, who are you?\n\n<|im_start|>assistant\n\n<think>\n\n</think>";
-    let ids = tokenizer
-        .encode(prompt, true)
-        .map_err(anyhow::Error::msg)?
-        .get_ids()
-        .to_vec();
+    let msgs = vec!["Hello, who are you?", "What is 2+2?"];
+    let ids_vec = msgs
+        .into_iter()
+        .map(|m| {
+            let prompt = build_prompt(m);
+            let enc = tokenizer
+                .encode(prompt, true)
+                .map_err(anyhow::Error::from)?
+            Ok(enc.get_ids().to_vec())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ids = ids_vec
+        .into_iter()
+        .map(|v| v.as_slice())
+        .collect::<Vec<_>>();
 
-    let logits_base = run_logits(&mut model, &ids, &device)?.to_dtype(DType::F32)?;
+    let logits_base = run_logits(&mut model, ids[0], &device)?.to_dtype(DType::F32)?;
 
     // Now load adapter
     let adapter_files = collect_safetensors(&adapter_dir)?;
@@ -97,7 +109,7 @@ fn test_qwen3() -> Result<()> {
     let _ = model.add_adapter(&cfg, vb, &real_lora_cfg)?;
     let _ = model.activate_adapter(Some("dora0"))?;
 
-    let logits_lora = run_logits(&mut model, &ids, &device)?.to_dtype(DType::F32)?;
+    let logits_lora = run_logits(&mut model, ids[0], &device)?.to_dtype(DType::F32)?;
     let diff = (&logits_lora - &logits_base)?
         .abs()?
         .sum_all()?
@@ -106,7 +118,7 @@ fn test_qwen3() -> Result<()> {
     assert_ne!(diff, 0f32);
 
     // --- Test generation
-    let output_ids = model.generate(&[&ids], Some(0.7), Some(0.9), Some(10), None)?;
+    let output_ids = model.generate(&ids, Some(0.7), Some(0.9), Some(10), None)?;
     let generated_text = tokens_to_string(&tokenizer, &output_ids[0])?.unwrap();
 
     anyhow::ensure!(
