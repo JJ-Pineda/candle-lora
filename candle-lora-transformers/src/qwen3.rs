@@ -728,6 +728,10 @@ impl ModelForCausalLM {
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new(base.embed_tokens.embeddings().clone(), None)
         } else {
+            if !vb.contains_tensor("lm_head.weight") {
+                return Err(Error::Msg("No 'lm_head' weights detected!".to_string()));
+            }
+
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
 
@@ -742,6 +746,10 @@ impl ModelForCausalLM {
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new((*guard).embed_tokens.embeddings().clone(), None)
         } else {
+            if !vb.contains_tensor("lm_head.weight") {
+                return Err(Error::Msg("No 'lm_head' weights detected!".to_string()));
+            }
+
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
 
