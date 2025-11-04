@@ -7,23 +7,16 @@ use candle_transformers::generation::LogitsProcessor;
 use std::sync::{Arc, RwLock};
 use tokenizers::Tokenizer;
 
-fn get_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
-}
-
-#[cfg(target_os = "macos")]
-fn metal_or_cpu() -> Device {
-    Device::new_metal(0).unwrap_or_else({
-        |e| {
-            eprintln!("Metal not detected: {e}");
-            Device::Cpu
+fn get_device_and_dtype() -> (Device, DType) {
+    if let Ok(device) = Device::new_cuda(0) {
+        (device, DType::BF16)
+    } else {
+        if let Ok(device) = Device::new_metal(0) {
+            (device, DType::F16)
+        } else {
+            (Device::Cpu, DType::F32)
         }
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn metal_or_cpu() -> Device {
-    Device::Cpu
+    }
 }
 
 fn collect_safetensors(dir: &str) -> Result<Vec<std::path::PathBuf>> {
@@ -74,32 +67,16 @@ fn test_qwen3() -> Result<()> {
     let cfg_file = std::fs::File::open(&cfg_path)
         .with_context(|| format!("opening config json at {cfg_path}"))?;
     let cfg: Config = serde_json::from_reader(cfg_file)?;
-
     let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!(e))?;
 
-    // --- Device/dtype (CPU for determinism in CI) ---
-    let device = metal_or_cpu();
-    let dtype = if device.is_metal() {
-        DType::F16
-    } else {
-        DType::F32
-    };
-
-    let base_weight_files = collect_safetensors(&base_dir)?;
-
     // --- Load base weights separately for comparison ---
+    let base_weight_files = collect_safetensors(&base_dir)?;
+    let (device, dtype) = get_device_and_dtype();
     let vb = from_mmaped_safetensors(&base_weight_files, dtype, &device, false)?;
 
-    // --- LoRA config (adjust rank/alpha if needed) ---
-    let default_lora_cfg = LoraConfig::new(8, 16.0, None);
-
     // --- Build model ---
-    let model = Arc::new(RwLock::new(Model::new(
-        &cfg,
-        vb.clone(),
-        default_lora_cfg.clone(),
-    )?));
-
+    let default_lora_cfg = LoraConfig::new(8, 16.0, None);
+    let model = Arc::new(RwLock::new(Model::new(&cfg, vb.clone(), default_lora_cfg)?));
     let mut model = ModelForCausalLM::from_base(Arc::clone(&model), &cfg, vb)?;
 
     // --- Tiny generation loop (greedy / top-p+temp) ---
@@ -113,6 +90,7 @@ fn test_qwen3() -> Result<()> {
 
     let logits_base = run_logits(&mut model, &ids, &device)?.to_dtype(DType::F32)?;
 
+    // Now load adapter
     let adapter_files = collect_safetensors(&adapter_dir)?;
     let vb = from_mmaped_safetensors(&adapter_files, dtype, &device, false)?;
 
