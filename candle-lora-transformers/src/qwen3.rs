@@ -104,7 +104,7 @@ impl Qwen3MLP {
         let gate_proj = MultiLoraLinear::new(
             &gate_proj_base,
             &gate_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("gate_proj.lora_linear"),
             gate_proj_id,
         )?;
@@ -115,7 +115,7 @@ impl Qwen3MLP {
         let up_proj = MultiLoraLinear::new(
             &up_proj_base,
             &up_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("up_proj.lora_linear"),
             up_proj_id,
         )?;
@@ -127,7 +127,7 @@ impl Qwen3MLP {
         let down_proj = MultiLoraLinear::new(
             &down_proj_base,
             &down_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("down_proj.lora_linear"),
             down_proj_id,
         )?;
@@ -168,7 +168,7 @@ impl Qwen3MLP {
         let gate_proj_id = 0;
         self.gate_proj.add_adapter(
             &gate_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("gate_proj.lora_linear"),
             gate_proj_id,
         )?;
@@ -177,7 +177,7 @@ impl Qwen3MLP {
         let up_proj_id = 0;
         self.up_proj.add_adapter(
             &up_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("up_proj.lora_linear"),
             up_proj_id,
         )?;
@@ -186,7 +186,7 @@ impl Qwen3MLP {
         let down_proj_id = 0;
         self.down_proj.add_adapter(
             &down_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("down_proj.lora_linear"),
             down_proj_id,
         )?;
@@ -274,7 +274,7 @@ impl Qwen3Attention {
         let q_proj = MultiLoraLinear::new(
             &q_proj_base,
             &q_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("q_proj.lora_linear"),
             q_proj_id,
         )?;
@@ -286,7 +286,7 @@ impl Qwen3Attention {
         let k_proj = MultiLoraLinear::new(
             &k_proj_base,
             &k_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("k_proj.lora_linear"),
             k_proj_id,
         )?;
@@ -298,7 +298,7 @@ impl Qwen3Attention {
         let v_proj = MultiLoraLinear::new(
             &v_proj_base,
             &v_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("v_proj.lora_linear"),
             v_proj_id,
         )?;
@@ -309,7 +309,7 @@ impl Qwen3Attention {
         let o_proj = MultiLoraLinear::new(
             &o_proj_base,
             &o_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("o_proj.lora_linear"),
             o_proj_id,
         )?;
@@ -384,7 +384,7 @@ impl Qwen3Attention {
         let q_proj_id = 0;
         self.q_proj.add_adapter(
             &q_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("q_proj.lora_linear"),
             q_proj_id,
         )?;
@@ -393,7 +393,7 @@ impl Qwen3Attention {
         let k_proj_id = 0;
         self.k_proj.add_adapter(
             &k_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("k_proj.lora_linear"),
             k_proj_id,
         )?;
@@ -402,7 +402,7 @@ impl Qwen3Attention {
         let v_proj_id = 0;
         self.v_proj.add_adapter(
             &v_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("v_proj.lora_linear"),
             v_proj_id,
         )?;
@@ -411,7 +411,7 @@ impl Qwen3Attention {
         let o_proj_id = 0;
         self.o_proj.add_adapter(
             &o_proj_config,
-            &lora_config,
+            lora_config,
             &vb.pp("o_proj.lora_linear"),
             o_proj_id,
         )?;
@@ -568,12 +568,12 @@ impl DecoderLayer {
     fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
         if let Some(name) = adapter_name {
             if !self.adapters.contains(&name.to_string()) {
-                return Err(Error::Msg(format!("Adapter '{}' does not exist!", name)));
+                return Err(Error::Msg(format!("Adapter '{name}' does not exist!")));
             }
         }
 
-        let _ = self.self_attn.activate_adapter(adapter_name);
-        let _ = self.mlp.activate_adapter(adapter_name);
+        self.self_attn.activate_adapter(adapter_name);
+        self.mlp.activate_adapter(adapter_name);
         self.active_adapter = adapter_name.map(String::from);
 
         Ok(())
@@ -692,7 +692,7 @@ impl Model {
     fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
         self.active_adapter = adapter_name.map(String::from);
         for i in 0..self.layers.len() {
-            let _ = self.layers[i].activate_adapter(adapter_name)?;
+            self.layers[i].activate_adapter(adapter_name)?;
         }
 
         Ok(())
@@ -743,7 +743,7 @@ impl ModelForCausalLM {
     pub fn from_base(base: Arc<RwLock<Model>>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let guard = base.read().unwrap();
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new((*guard).embed_tokens.embeddings().clone(), None)
+            Linear::new(guard.embed_tokens.embeddings().clone(), None)
         } else {
             if !vb.contains_tensor("lm_head.weight") {
                 return Err(Error::Msg("No 'lm_head' weights detected!".to_string()));
@@ -765,7 +765,7 @@ impl ModelForCausalLM {
         lora_config: &LoraConfig,
     ) -> Result<()> {
         let mut guard = self.base.write().unwrap();
-        let _ = (*guard).add_adapter(cfg, vb, lora_config)?;
+        guard.add_adapter(cfg, vb, lora_config)?;
         Ok(())
     }
 
@@ -800,7 +800,7 @@ impl ModelForCausalLM {
         // Acquire device once without holding the lock
         let device = {
             let guard = self.base.read().unwrap();
-            (*guard).device.clone()
+            guard.device.clone()
         };
 
         // To-do: need to introduce padding and make the block below vectorized

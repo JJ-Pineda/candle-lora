@@ -34,9 +34,9 @@ pub fn from_mmaped_safetensors<'a, P: AsRef<Path>>(
             }
         } else {
             for (name, _) in tensors.tensors().iter().tqdm() {
-                let verified_name = verify_name(&name);
+                let verified_name = verify_name(name);
                 let tensor = tensors
-                    .load(&name, device)?
+                    .load(name, device)?
                     .to_device(device)?
                     .to_dtype(dtype)?;
                 ws.insert(verified_name, Var::from_tensor(&tensor)?);
@@ -64,7 +64,7 @@ fn verify_name(name: &str) -> String {
         name.to_string()
     };
 
-    return new_name;
+    new_name
 }
 
 /// Load tensors into a VarBuilder backed by a VarMap using NpzTensors.
