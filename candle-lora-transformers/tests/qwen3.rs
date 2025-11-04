@@ -43,6 +43,7 @@ fn collect_safetensors(dir: &str) -> Result<Vec<std::path::PathBuf>> {
 fn run_logits(model: &mut ModelForCausalLM, input_ids: &[u32], device: &Device) -> Result<Tensor> {
     let x = Tensor::new(input_ids, device)?.unsqueeze(0)?;
     let logits = model.forward(&x, 0)?.squeeze(0)?.squeeze(0)?;
+    model.clear_kv_cache();
     Ok(logits)
 }
 
@@ -120,69 +121,70 @@ fn test_qwen3() -> Result<()> {
     let _ = model.activate_adapter(Some("dora0"))?;
 
     let logits_lora = run_logits(&mut model, &ids, &device)?.to_dtype(DType::F32)?;
-    // let diff = (&logits_lora - &logits_base)?
-    //     .abs()?
-    //     .sum_all()?
-    //     .to_scalar::<f32>()?;
+    let diff = (&logits_lora - &logits_base)?
+        .abs()?
+        .sum_all()?
+        .to_scalar::<f32>()?;
 
-    // assert_ne!(diff, 0f32);
+    assert_ne!(diff, 0f32);
 
-    // // --- Tiny generation loop (greedy / top-p+temp) ---
-    // // Small, deterministic settings for testability.
-    // let seed: u64 = 42;
-    // let temperature: Option<f64> = Some(0.7);
-    // let top_p: Option<f64> = Some(0.9);
-    // let mut lp = LogitsProcessor::new(seed, temperature, top_p);
+    // --- Tiny generation loop (greedy / top-p+temp) ---
+    // Small, deterministic settings for testability.
+    let seed: u64 = 42;
+    let temperature: Option<f64> = Some(0.7);
+    let top_p: Option<f64> = Some(0.9);
+    let mut lp = LogitsProcessor::new(seed, temperature, top_p);
 
-    // let eos_id = tokenizer
-    //     .get_vocab(true)
-    //     .get("<|endoftext|>")
-    //     .copied()
-    //     .unwrap_or_else(|| {
-    //         println!("Could not find EOS token!");
-    //         u32::MAX
-    //     });
+    let eos_id = tokenizer
+        .get_vocab(true)
+        .get("<|endoftext|>")
+        .copied()
+        .unwrap_or_else(|| {
+            println!("Could not find EOS token!");
+            u32::MAX
+        });
 
-    // let max_new_tokens = 48usize; // keep short for test runtime
-    // let mut generated_text = String::new();
+    let max_new_tokens = 10usize; // keep short for test runtime
+    let mut generated_text = String::new();
 
-    // for step in 0..max_new_tokens {
-    //     // Only feed the full context once; then one token at a time using KV-cache.
-    //     let ctx_len = if step == 0 { ids.len() } else { 1 };
-    //     let start_pos = ids.len().saturating_sub(ctx_len);
-    //     let ctx = &ids[start_pos..];
+    println!("Starting generation loop...");
+    for step in 0..max_new_tokens {
+        // Only feed the full context once; then one token at a time using KV-cache.
+        let ctx_len = if step == 0 { ids.len() } else { 1 };
+        let start_pos = ids.len().saturating_sub(ctx_len);
+        let ctx = &ids[start_pos..];
 
-    //     let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
-    //     let logits = model
-    //         .forward(&input, start_pos)
-    //         .context("forward pass")?
-    //         .squeeze(0)?
-    //         .squeeze(0)?
-    //         .to_dtype(DType::F32)?;
+        let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
+        let logits = model
+            .forward(&input, start_pos)
+            .context("forward pass")?
+            .squeeze(0)?
+            .squeeze(0)?
+            .to_dtype(DType::F32)?;
 
-    //     let next_id = lp.sample(&logits).context("sampling")?;
-    //     ids.push(next_id);
-    //     if next_id == eos_id {
-    //         break;
-    //     }
+        let next_id = lp.sample(&logits).context("sampling")?;
+        ids.push(next_id);
+        if next_id == eos_id {
+            break;
+        }
 
-    //     // Best-effort incremental decode
-    //     if let Some(tok) = token_to_string(&tokenizer, next_id)? {
-    //         generated_text.push_str(&tok);
-    //     }
-    // }
+        // Best-effort incremental decode
+        if let Some(tok) = token_to_string(&tokenizer, next_id)? {
+            generated_text.push_str(&tok);
+        }
+    }
 
-    // // Clear KV cache
-    // model.clear_kv_cache();
+    // Clear KV cache
+    model.clear_kv_cache();
 
-    // // --- Basic assertions ---
-    // // Ensure we *actually* produced something beyond the prompt.
-    // anyhow::ensure!(
-    //     generated_text.trim().len() >= 1,
-    //     "Model produced empty output text."
-    // );
+    // --- Basic assertions ---
+    // Ensure we *actually* produced something beyond the prompt.
+    anyhow::ensure!(
+        generated_text.trim().len() >= 1,
+        "Model produced empty output text."
+    );
 
-    // println!("{}", generated_text);
+    println!("{}", generated_text);
 
     Ok(())
 }

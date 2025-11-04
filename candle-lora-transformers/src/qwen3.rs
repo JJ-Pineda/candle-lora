@@ -608,10 +608,10 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder, lora_config: LoraConfig) -> Result<Self> {
         let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb.pp("layers");
+        let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(
                 rotary.clone(),
@@ -724,7 +724,7 @@ pub struct ModelForCausalLM {
 
 impl ModelForCausalLM {
     pub fn new(cfg: &Config, vb: VarBuilder, lora_config: LoraConfig) -> Result<Self> {
-        let base = Model::new(cfg, vb.pp("model"), lora_config.clone())?;
+        let base = Model::new(cfg, vb.clone(), lora_config.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new(base.embed_tokens.embeddings().clone(), None)
         } else {
