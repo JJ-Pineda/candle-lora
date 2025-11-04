@@ -670,6 +670,35 @@ impl Model {
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
+    fn create_attention_mask_with_padding(
+        &self,
+        b: usize,
+        tgt: usize,
+        offset: usize,
+        padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let minf = f32::NEG_INFINITY;
+        let mut causal_mask = self.causal_mask(b, tgt, offset, None)?;
+
+        if let Some(pad_mask) = padding_mask {
+            // pad_mask shape: [b, tgt + offset] where 1 = valid, 0 = padding
+            // We need to broadcast it to [b, 1, tgt, tgt + offset] and mask padding positions
+            let pad_mask = pad_mask
+                .unsqueeze(1)? // [b, 1, tgt + offset]
+                .unsqueeze(1)? // [b, 1, 1, tgt + offset]
+                .broadcast_as(causal_mask.shape())?;
+
+            // Where pad_mask is 0 (padding), set attention to -inf
+            // Convert: 1 (valid) -> 0, 0 (padding) -> -inf
+            let inverted = pad_mask.affine(-1.0, 1.0)?; // 1 -> 0, 0 -> 1
+            let padding_penalty = inverted.affine(minf as f64, 0.0)?.to_dtype(self.dtype)?;
+
+            causal_mask = (causal_mask + padding_penalty)?;
+        }
+
+        Ok(causal_mask)
+    }
+
     fn add_adapter(
         &mut self,
         cfg: &Config,
@@ -698,18 +727,23 @@ impl Model {
         Ok(())
     }
 
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn forward(
+        &mut self,
+        input: &Tensor,
+        offset: usize,
+        padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
 
-        let causal = if l == 1 {
+        let attn_mask = if l == 1 && padding_mask.is_none() {
             None
         } else {
-            Some(self.causal_mask(b, l, offset, None)?)
+            Some(self.create_attention_mask_with_padding(b, l, offset, padding_mask)?)
         };
 
         for layer in &mut self.layers {
-            h = layer.forward(&h, causal.as_ref(), offset)?;
+            h = layer.forward(&h, attn_mask.as_ref(), offset)?;
         }
         self.norm.forward(&h)
     }
@@ -780,11 +814,63 @@ impl ModelForCausalLM {
         (*guard).clear_kv_cache();
     }
 
-    pub fn forward(&self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    /// Creates a padding mask for the first generation step if needed.
+    /// Returns None if there's no padding in the batch.
+    fn create_padding_mask(
+        &self,
+        continue_rows: &[usize],
+        padding_lengths: &[usize],
+        cols: usize,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let has_padding = continue_rows.iter().any(|&r| padding_lengths[r] > 0);
+
+        if !has_padding {
+            return Ok(None);
+        }
+
+        // Create a mask tensor: 1 for valid tokens, 0 for padding
+        let mask_data: Vec<f32> = continue_rows
+            .iter()
+            .flat_map(|&r| {
+                let pad_len = padding_lengths[r];
+                let valid_len = cols - pad_len;
+                // Left padding: pad_len zeros, then valid_len ones
+                std::iter::repeat(0.0f32)
+                    .take(pad_len)
+                    .chain(std::iter::repeat(1.0f32).take(valid_len))
+            })
+            .collect();
+
+        Ok(Some(Tensor::from_vec(
+            mask_data,
+            (continue_rows.len(), cols),
+            device,
+        )?))
+    }
+
+    /// Removes padding tokens from generated sequences.
+    fn strip_padding(&self, ids: Vec<Vec<u32>>, padding_token_id: u32) -> Vec<Vec<u32>> {
+        ids.iter()
+            .map(|v| {
+                v.iter()
+                    .filter(|&&id| id != padding_token_id)
+                    .copied()
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn forward(
+        &self,
+        input: &Tensor,
+        offset: usize,
+        padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
         let mut guard = self.base.write().unwrap();
         (*guard)
-            .forward(input, offset)?
+            .forward(input, offset, padding_mask)?
             .narrow(1, l - 1, 1)?
             .apply(&self.lm_head)
     }
@@ -797,117 +883,94 @@ impl ModelForCausalLM {
         max_new_tokens: Option<u32>,
         seed: Option<u64>,
     ) -> Result<Vec<Vec<u32>>> {
-        // Acquire device once without holding the lock
+        // Configuration
+        let eos_token_id: u32 = 151643;
+        let padding_token_id: u32 = 151654;
+        let max_tokens = max_new_tokens.unwrap_or(512);
+
+        // Get device without holding lock
         let device = {
             let guard = self.base.read().unwrap();
             guard.device.clone()
         };
 
-        // To-do: need to introduce padding and make the block below vectorized
+        // Pad input sequences to same length
         let rows = input_ids.len();
         let cols = input_ids.iter().map(|r| r.len()).max().unwrap_or(0);
+        let (mut ids, padding_lengths) = {
+            let mut padded = Vec::with_capacity(rows);
+            let mut pad_lens = Vec::with_capacity(rows);
 
-        // Taken from unsloth's Qwen3 "generation_config.json"
-        let eos_token_id: u32 = 151643;
-        let padding_token_id: u32 = 151654;
+            for &seq in input_ids.iter() {
+                let pad_len = cols - seq.len();
+                pad_lens.push(pad_len);
 
-        let mut padded_input_ids: Vec<Vec<u32>> = Vec::with_capacity(rows);
+                let mut padded_seq = vec![padding_token_id; pad_len];
+                padded_seq.extend(seq);
+                padded.push(padded_seq);
+            }
+            (padded, pad_lens)
+        };
 
-        for &v in input_ids.iter() {
-            let mut padded = vec![padding_token_id; cols - v.len()];
-            padded.extend(v);
-            padded_input_ids.push(padded);
-        }
-
+        // Initialize generation state
         let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
-
-        let mut ids = padded_input_ids
-            .iter()
-            .map(|v| v.to_vec())
-            .collect::<Vec<Vec<u32>>>();
-
         let mut done_rows: Vec<usize> = vec![];
+        self.clear_kv_cache();
 
-        // Clear KV cache once at the start
-        {
-            let mut guard = self.base.write().unwrap();
-            guard.clear_kv_cache();
-        }
-
+        // Generation loop
         println!("Starting generation");
-        for step in 0..max_new_tokens.unwrap_or(512) {
-            // Keep only rows we are NOT done with
-            let continue_rows = (0..rows)
-                .filter(|i| !done_rows.contains(i))
-                .collect::<Vec<_>>();
+        for step in 0..max_tokens {
+            // Get rows still generating
+            let continue_rows: Vec<usize> = (0..rows).filter(|i| !done_rows.contains(i)).collect();
 
             if continue_rows.is_empty() {
                 break;
             }
 
-            let continue_ids = continue_rows
-                .iter()
-                .map(|&i| ids[i].clone())
-                .collect::<Vec<_>>();
-
-            // Only feed the full context once; then one token at a time using KV-cache.
+            // Prepare input for this step (full context once, then one token at a time)
             let ctx_len = if step == 0 { cols } else { 1 };
             let start_pos = if step == 0 {
                 0
             } else {
                 cols + step as usize - 1
             };
-            let ctx = continue_ids
+
+            let ctx: Vec<&[u32]> = continue_rows
                 .iter()
-                .map(|r| {
-                    let start_idx = r.len().saturating_sub(ctx_len);
-                    &r[start_idx..]
+                .map(|&i| {
+                    let start_idx = ids[i].len().saturating_sub(ctx_len);
+                    &ids[i][start_idx..]
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
             let input = Tensor::new(ctx, &device)?;
 
-            // Use self.forward which properly handles lm_head projection
-            // This returns [batch_size, 1, vocab_size]
+            // Create padding mask only for first step if needed
+            let padding_mask = if step == 0 {
+                self.create_padding_mask(&continue_rows, &padding_lengths, cols, &device)?
+            } else {
+                None
+            };
+
+            // Forward pass
             let logits = self
-                .forward(&input, start_pos)?
-                .squeeze(1)? // Remove the sequence dimension -> [batch_size, vocab_size]
+                .forward(&input, start_pos, padding_mask.as_ref())?
+                .squeeze(1)?
                 .to_dtype(DType::F32)?;
 
+            // Sample next tokens
             for (idx, &r) in continue_rows.iter().enumerate() {
-                if !done_rows.contains(&r) {
-                    let next_id = lp.sample(&logits.get(idx)?)?;
-                    ids[r].push(next_id);
+                let next_id = lp.sample(&logits.get(idx)?)?;
+                ids[r].push(next_id);
 
-                    if next_id == eos_token_id {
-                        done_rows.push(r);
-                    }
+                if next_id == eos_token_id {
+                    done_rows.push(r);
                 }
             }
         }
 
-        // Strip padding
-        let depadded = ids
-            .iter()
-            .map(|v| {
-                v.iter()
-                    .filter_map(|&id| {
-                        if id != padding_token_id {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        // Clear KV cache at the end
-        {
-            let mut guard = self.base.write().unwrap();
-            guard.clear_kv_cache();
-        }
-
-        Ok(depadded)
+        // Cleanup and return
+        self.clear_kv_cache();
+        Ok(self.strip_padding(ids, padding_token_id))
     }
 }

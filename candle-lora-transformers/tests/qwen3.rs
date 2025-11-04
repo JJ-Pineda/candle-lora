@@ -34,7 +34,7 @@ fn collect_safetensors(dir: &str) -> Result<Vec<std::path::PathBuf>> {
 
 fn run_logits(model: &mut ModelForCausalLM, input_ids: &[u32], device: &Device) -> Result<Tensor> {
     let x = Tensor::new(input_ids, device)?.unsqueeze(0)?;
-    let logits = model.forward(&x, 0)?.squeeze(0)?.squeeze(0)?;
+    let logits = model.forward(&x, 0, None)?.squeeze(0)?.squeeze(0)?;
     model.clear_kv_cache();
     Ok(logits)
 }
