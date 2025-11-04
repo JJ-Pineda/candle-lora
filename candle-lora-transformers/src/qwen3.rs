@@ -797,8 +797,11 @@ impl ModelForCausalLM {
         max_new_tokens: Option<u32>,
         seed: Option<u64>,
     ) -> Result<Vec<Vec<u32>>> {
-        let guard = self.base.read().unwrap();
-        let device = &(*guard).device;
+        // Acquire device once without holding the lock
+        let device = {
+            let guard = self.base.read().unwrap();
+            (*guard).device.clone()
+        };
 
         // To-do: need to introduce padding and make the block below vectorized
         let rows = input_ids.len();
@@ -810,11 +813,11 @@ impl ModelForCausalLM {
 
         let mut padded_input_ids: Vec<Vec<u32>> = Vec::with_capacity(rows);
 
-        let _ = input_ids.iter().enumerate().map(|(i, &v)| {
-            let padding = vec![padding_token_id; cols - v.len()];
-            padded_input_ids[i].extend(padding);
-            padded_input_ids[i].extend(v);
-        });
+        for &v in input_ids.iter() {
+            let mut padded = vec![padding_token_id; cols - v.len()];
+            padded.extend(v);
+            padded_input_ids.push(padded);
+        }
 
         let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
 
@@ -824,21 +827,23 @@ impl ModelForCausalLM {
             .collect::<Vec<Vec<u32>>>();
 
         let mut done_rows: Vec<usize> = vec![];
-        let mut guard = self.base.write().unwrap();
-        guard.clear_kv_cache();
+
+        // Clear KV cache once at the start
+        {
+            let mut guard = self.base.write().unwrap();
+            guard.clear_kv_cache();
+        }
 
         println!("Starting generation");
         for step in 0..max_new_tokens.unwrap_or(512) {
-            // Remove rows we are done with
+            // Keep only rows we are NOT done with
             let continue_rows = (0..rows)
-                .filter_map(|i| {
-                    if done_rows.contains(&i) {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
+                .filter(|i| !done_rows.contains(i))
                 .collect::<Vec<_>>();
+
+            if continue_rows.is_empty() {
+                break;
+            }
 
             let continue_ids = continue_rows
                 .iter()
@@ -847,22 +852,31 @@ impl ModelForCausalLM {
 
             // Only feed the full context once; then one token at a time using KV-cache.
             let ctx_len = if step == 0 { cols } else { 1 };
-            let start_pos = cols.saturating_sub(ctx_len);
+            let start_pos = if step == 0 {
+                0
+            } else {
+                cols + step as usize - 1
+            };
             let ctx = continue_ids
                 .iter()
-                .map(|r| &r[start_pos..])
+                .map(|r| {
+                    let start_idx = r.len().saturating_sub(ctx_len);
+                    &r[start_idx..]
+                })
                 .collect::<Vec<_>>();
 
-            let input = Tensor::new(ctx, &device)?.unsqueeze(0)?; // [1, ctx_len]
-            let logits = guard
+            let input = Tensor::new(ctx, &device)?;
+
+            // Use self.forward which properly handles lm_head projection
+            // This returns [batch_size, 1, vocab_size]
+            let logits = self
                 .forward(&input, start_pos)?
-                .squeeze(0)?
-                .squeeze(0)?
+                .squeeze(1)? // Remove the sequence dimension -> [batch_size, vocab_size]
                 .to_dtype(DType::F32)?;
 
-            for r in 0..rows {
+            for (idx, &r) in continue_rows.iter().enumerate() {
                 if !done_rows.contains(&r) {
-                    let next_id = lp.sample(&logits.get(r)?)?;
+                    let next_id = lp.sample(&logits.get(idx)?)?;
                     ids[r].push(next_id);
 
                     if next_id == eos_token_id {
@@ -878,7 +892,7 @@ impl ModelForCausalLM {
             .map(|v| {
                 v.iter()
                     .filter_map(|&id| {
-                        if id == padding_token_id {
+                        if id != padding_token_id {
                             Some(id)
                         } else {
                             None
@@ -888,7 +902,12 @@ impl ModelForCausalLM {
             })
             .collect::<Vec<_>>();
 
-        guard.clear_kv_cache();
+        // Clear KV cache at the end
+        {
+            let mut guard = self.base.write().unwrap();
+            guard.clear_kv_cache();
+        }
+
         Ok(depadded)
     }
 }

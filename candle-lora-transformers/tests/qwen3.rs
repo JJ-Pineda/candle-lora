@@ -3,7 +3,6 @@ use candle_core::{DType, Device, Tensor};
 use candle_lora::LoraConfig;
 use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM};
 use candle_lora_transformers::varbuilder_utils::from_mmaped_safetensors;
-use candle_transformers::generation::LogitsProcessor;
 use std::sync::{Arc, RwLock};
 use tokenizers::Tokenizer;
 
