@@ -154,25 +154,42 @@ impl Merge for LoraConv2d {
             None => ba,
         };
 
-        // For DoRA, apply magnitude normalization
+        // For DoRA, apply magnitude normalization (row-wise)
+        // Conv2d weights are [out_channels, in_channels, kernel_h, kernel_w]
+        // We flatten to [out_channels, in_channels * kernel_h * kernel_w] for row-wise normalization
         if let Some(ref m) = self.m {
             let w = self.old.weight();
+            let original_shape = w.shape().clone();
 
-            // Compute column-wise norms of W + scaled_BA
-            let w_plus_ba = (w + &scaled_ba).map_err(Either::Right)?;
+            // Flatten weight to 2D: [out_channels, in_channels * kernel_h * kernel_w]
+            let out_channels = original_shape.dims()[0];
+            let spatial_dim =
+                original_shape.dims()[1] * original_shape.dims()[2] * original_shape.dims()[3];
+            let w_flat = w
+                .reshape((out_channels, spatial_dim))
+                .map_err(Either::Right)?;
+            let ba_flat = scaled_ba
+                .reshape((out_channels, spatial_dim))
+                .map_err(Either::Right)?;
+
+            // Compute row-wise norms of W + scaled_BA
+            let w_plus_ba = (&w_flat + &ba_flat).map_err(Either::Right)?;
             let norms = w_plus_ba
                 .sqr()
                 .map_err(Either::Right)?
-                .sum_keepdim(0)
+                .sum_keepdim(1) // Row-wise: sum over in_channels * kernel_h * kernel_w dimension
                 .map_err(Either::Right)?
                 .sqrt()
+                .map_err(Either::Right)?
+                .squeeze(1)
                 .map_err(Either::Right)?;
 
-            // Normalized weight: (m / norms) * (W + scaled_BA)
+            // Normalized weight: m * (W + scaled_BA) / ||W + scaled_BA||_2
+            let norm_scale = m.broadcast_div(&norms).map_err(Either::Right)?;
             let normalized = w_plus_ba
-                .broadcast_div(&norms)
+                .broadcast_mul(&norm_scale)
                 .map_err(Either::Right)?
-                .broadcast_mul(m)
+                .reshape(original_shape.dims())
                 .map_err(Either::Right)?;
 
             // Delta is normalized - W
@@ -224,48 +241,103 @@ impl Module for LoraConv2d {
             self.old.forward(input)
         } else {
             let scale = self.scale.unwrap();
-            let mut a_input = input.clone();
-            if self.dropout.is_some() {
-                a_input = self.dropout.as_ref().unwrap().forward(input, true)?;
-            }
+
+            // Dropout should only be applied to adapter path, not base model
+            let input_adapter = if self.dropout.is_some() {
+                self.dropout.as_ref().unwrap().forward(input, true)?
+            } else {
+                input.clone()
+            };
 
             if let Some(ref m) = self.m {
-                // DoRA implementation
-                // Calculate W' using get_delta_weight logic
-                let delta_weight = match self.old.weight().shape().dims()[2..4] {
-                    [1, 1] => self
-                        .b_conv
-                        .weight()
-                        .squeeze(3)?
-                        .squeeze(2)?
-                        .matmul(&self.a_conv.weight().squeeze(3)?.squeeze(2)?)?
-                        .unsqueeze(2)?
-                        .unsqueeze(3)?,
-                    _ => {
-                        let conv =
-                            Conv2d::new(self.b_conv.weight().clone(), None, *self.old.config());
-                        conv.forward(&self.a_conv.weight().permute((1, 0, 2, 3))?)?
-                    }
-                };
+                // DoRA implementation (memory-efficient, row-wise normalization)
+                // Conv2d weights are [out_channels, in_channels, kernel_h, kernel_w]
+                // DoRA: W' = m * (W + scale*BA) / ||W + scale*BA||_2
+                // where ||·||_2 is row-wise L2 norm (norm across in_channels*kernel_h*kernel_w for each out_channel)
+                // Per DoRA paper Section 3.1: magnitude is computed per output channel (row)
+                // This mirrors loralinear.rs but adapted for Conv2d weight layout
 
-                let delta_weight = delta_weight.mul(scale)?;
-                let w_prime = (self.old.weight() + delta_weight)?;
+                // Store bias to add at the end
+                let bias = self.old.bias();
 
-                // Calculate column-wise norm of W'
-                let w_prime_norm = w_prime.sqr()?.sum_keepdim(0)?.sqrt()?;
+                // IMPORTANT: Compute W*x WITHOUT bias and WITHOUT dropout (bias added at the end)
+                let w = self.old.weight();
+                let w_conv = Conv2d::new(w.clone(), None, *self.config());
+                let w_out = w_conv.forward(input)?; // Use original input
 
-                // Apply magnitude vector and normalize: m * W' / ||W'||
-                let normalized_weight = w_prime.broadcast_div(&w_prime_norm)?;
-                let scaled_weight = normalized_weight.broadcast_mul(m)?;
+                // Compute adapter output: scale*B@A * x with dropout applied
+                let ba_out = self
+                    .b_conv
+                    .forward(&self.a_conv.forward(&input_adapter)?)? // Use input with dropout
+                    .mul(scale)?;
 
-                // Apply the scaled weight
-                let conv = Conv2d::new(scaled_weight, self.old.bias().cloned(), *self.old.config());
-                conv.forward(input)
+                // Combined output: W*x + scale*B@A*x (still no bias)
+                let combined = (&w_out + &ba_out)?;
+
+                // Compute row-wise norms of W + scale*BA efficiently
+                // WITHOUT materializing the full BA matrix multiple times
+                // For each row i: ||W_i + scale*BA_i||² = sum_j (W_ij + scale*(BA)_ij)²
+                // We use: ||W_i + scale*BA_i||² = ||W_i||² + 2*scale*W_i·(BA)_i + scale²||BA_i||²
+
+                let w = self.old.weight(); // [out_channels, in_channels, kernel_h, kernel_w]
+                let original_shape = w.shape().clone();
+
+                // Flatten to 2D for row-wise operations: [out_channels, in_channels * kernel_h * kernel_w]
+                let out_channels = original_shape.dims()[0];
+                let spatial_dim =
+                    original_shape.dims()[1] * original_shape.dims()[2] * original_shape.dims()[3];
+                let w_flat = w.reshape((out_channels, spatial_dim))?;
+
+                // Get B and A weights and flatten appropriately
+                let b_weight = self.b_conv.weight(); // [out_channels, rank, 1, 1]
+                let a_weight = self.a_conv.weight(); // [rank, in_channels, kernel_h, kernel_w]
+
+                let b_flat = b_weight.reshape((out_channels, b_weight.dim(1)?))?; // [out_channels, rank]
+                let a_flat = a_weight.reshape((a_weight.dim(0)?, spatial_dim))?; // [rank, in_channels * kernel_h * kernel_w]
+
+                // Compute ||W_i||² for each row (sum over spatial dimension)
+                let w_norm_sq = w_flat.sqr()?.sum_keepdim(1)?; // [out_channels, 1]
+
+                // Compute ||BA_i||² efficiently using the kernel trick
+                // For each row i: ||BA_i||² = (BA)(BA)^T_ii = (B @ A @ A^T @ B^T)_ii
+                let aat = a_flat.matmul(&a_flat.t()?)?; // [rank, rank]
+                let b_aat = b_flat.matmul(&aat)?; // [out_channels, rank]
+                let ba_norm_sq = (&b_aat * &b_flat)?.sum_keepdim(1)?; // [out_channels, 1]
+
+                // Compute 2*W_i·(BA)_i efficiently
+                let wa_t = w_flat.matmul(&a_flat.t()?)?; // [out_channels, rank]
+                let cross = (&wa_t * &b_flat)?.sum_keepdim(1)?.mul(2.0 * scale)?; // [out_channels, 1]
+
+                // ||W + scale*BA||² = ||W||² + 2*scale*W·BA + scale²||BA||²
+                let norms = (w_norm_sq + cross + ba_norm_sq.mul(scale * scale)?)?
+                    .sqrt()?
+                    .squeeze(1)?; // [out_channels]
+
+                // Apply DoRA row-wise: m * combined / norms
+                // m is [out_channels], norms is [out_channels]
+                // This normalizes each output channel (row) independently
+                // For Conv2d, output is [batch, out_channels, height, width], so reshape to [1, out_channels, 1, 1]
+                let norm_scale = m.broadcast_div(&norms)?; // [out_channels]
+                let norm_scale = norm_scale.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?; // [1, out_channels, 1, 1]
+                let mut result = combined.broadcast_mul(&norm_scale)?;
+
+                // Add bias at the very end
+                if let Some(b) = bias {
+                    let b_reshaped = b.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?; // [1, out_channels, 1, 1]
+                    result = result.broadcast_add(&b_reshaped)?;
+                }
+                Ok(result)
             } else {
                 // Standard LoRA implementation
-                let weight = self.old.forward(input)?;
-                let tmp = self.b_conv.forward(&self.a_conv.forward(&a_input)?)?;
-                &weight + tmp.mul(scale)?
+                // Base model uses original input (no dropout)
+                let mut result = self.old.forward(input)?;
+                // Adapter uses input with dropout
+                let adapter_out = self
+                    .b_conv
+                    .forward(&self.a_conv.forward(&input_adapter)?)?
+                    .mul(scale)?;
+                result = (result + adapter_out)?;
+                Ok(result)
             }
         }
     }

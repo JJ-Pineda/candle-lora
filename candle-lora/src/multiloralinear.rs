@@ -165,7 +165,9 @@ impl Module for MultiLoraLinear {
             // We ensure that the "active_adapter" always exists otherwise it's None
             // I.e. "unwrap" is safe here
             let adapter_name = self.active_adapter.clone().unwrap();
-            let mut result = self.old.forward(input)?;
+
+            // Store bias to add at the end
+            let bias = self.old.bias();
 
             let scale = *self.scale.get(&adapter_name).unwrap();
 
@@ -182,21 +184,23 @@ impl Module for MultiLoraLinear {
                     // where ||·||_2 is row-wise L2 norm (norm across in_features for each out_feature)
                     // Per DoRA paper Section 3.1: magnitude is computed per output channel (row)
 
-                    // Note: `result` already contains W@x from line 169
+                    // IMPORTANT: Compute W@x WITHOUT bias (bias added at the end)
+                    let w = self.old.weight(); // [out_features, in_features]
+                    let w_linear = Linear::new(w.clone(), None);
+                    let w_out = w_linear.forward(&input_new)?; // W@x without bias
 
                     // Compute adapter output: scale*B@A@x
                     let a_out = a.forward(&input_new)?;
                     let ba_out = b.forward(&a_out)?.mul(scale)?;
 
-                    // Combined output: W@x + scale*B@A@x
-                    let combined = (&result + &ba_out)?;
+                    // Combined output: W@x + scale*B@A@x (still no bias)
+                    let combined = (&w_out + &ba_out)?;
 
                     // Compute row-wise norms of W + scale*BA efficiently
                     // WITHOUT materializing the full BA matrix
                     // For each row i: ||W_i + scale*BA_i||² = sum_j (W_ij + scale*(BA)_ij)²
                     // We use: ||W_i + scale*BA_i||² = ||W_i||² + 2*scale*W_i·(BA)_i + scale²||BA_i||²
 
-                    let w = self.old.weight(); // [out_features, in_features]
                     let b_weight = b.weight(); // [out_features, rank]
                     let a_weight = a.weight(); // [rank, in_features]
 
@@ -228,19 +232,33 @@ impl Module for MultiLoraLinear {
                     // m is [out_features], norms is [out_features]
                     // This normalizes each output feature (row) independently
                     let norm_scale = m.broadcast_div(&norms)?; // [out_features]
-                    result = combined.broadcast_mul(&norm_scale)?;
+                    let mut result = combined.broadcast_mul(&norm_scale)?;
 
-                    // Add bias if present
-                    if let Some(bias) = self.old.bias() {
-                        result = result.broadcast_add(bias)?;
+                    // Add bias at the very end
+                    if let Some(b) = bias {
+                        result = result.broadcast_add(b)?;
                     }
+                    Ok(result)
                 } else {
                     // Standard LoRA implementation
+                    // Compute W@x without bias
+                    let w = self.old.weight();
+                    let w_linear = Linear::new(w.clone(), None);
+                    let mut result = w_linear.forward(&input_new)?;
+
+                    // Add adapter output
                     let adapter_out = b.forward(&a.forward(&input_new)?)?.mul(scale)?;
                     result = (result + adapter_out)?;
+
+                    // Add bias at the end
+                    if let Some(b) = bias {
+                        result = result.broadcast_add(b)?;
+                    }
+                    Ok(result)
                 }
+            } else {
+                self.old.forward(input)
             }
-            Ok(result)
         }
     }
 }

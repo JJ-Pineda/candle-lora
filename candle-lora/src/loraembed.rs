@@ -103,24 +103,77 @@ impl Merge for LoraEmbedding {
             None => ba,
         };
 
-        // For DoRA, apply magnitude normalization
+        // For DoRA, apply magnitude normalization (column-wise)
         // Note: embeddings are stored as [num_embeddings, embedding_dim]
         // but we compute BA as [embedding_dim, num_embeddings]
+        // We use column-wise normalization (per embedding vector)
         if let Some(ref m) = self.m {
-            // Compute W^T + scaled_BA (both are [embedding_dim, num_embeddings])
             let w_t = self.embeddings().t().map_err(Either::Right)?;
-            let w_plus_ba = (&w_t + &scaled_ba).map_err(Either::Right)?;
 
-            // Compute column-wise norms
-            let norms = w_plus_ba
+            // Compute column-wise norms of W^T + scaled_BA efficiently
+            // WITHOUT rematerializing BA multiple times
+            // For each column j: ||W^T_j + scaled_BA_j||² = sum_i (W^T_ij + scaled_BA_ij)²
+            // We use: ||W^T_j + scaled_BA_j||² = ||W^T_j||² + 2*scale*W^T_j·BA_j + scale²||BA_j||²
+
+            let scale_val = self.scale.unwrap_or(1.0);
+
+            // Compute ||W^T_j||² for each column (sum over embedding_dim dimension)
+            let w_norm_sq = w_t
                 .sqr()
                 .map_err(Either::Right)?
                 .sum_keepdim(0)
-                .map_err(Either::Right)?
-                .sqrt()
-                .map_err(Either::Right)?;
+                .map_err(Either::Right)?; // [1, num_embeddings]
 
-            // Normalized weight: (m / norms) * (W^T + scaled_BA)
+            // Compute ||BA_j||² efficiently using the kernel trick
+            // For column j: ||BA_j||² = A_j^T @ B^T @ B @ A_j
+            let btb = self
+                .b
+                .t()
+                .map_err(Either::Right)?
+                .matmul(&self.b)
+                .map_err(Either::Right)?; // [rank, rank]
+            let a_btb = self
+                .a
+                .t()
+                .map_err(Either::Right)?
+                .matmul(&btb)
+                .map_err(Either::Right)?; // [num_embeddings, rank]
+            let ba_norm_sq_cols = (&a_btb * &self.a.t().map_err(Either::Right)?)
+                .map_err(Either::Right)?
+                .sum_keepdim(1)
+                .map_err(Either::Right)?
+                .t()
+                .map_err(Either::Right)?; // [1, num_embeddings]
+
+            // Compute 2*W^T_j·BA_j efficiently
+            // For each column: (B^T @ W^T) ⊙ A summed over rank dimension
+            let bt_wt = self
+                .b
+                .t()
+                .map_err(Either::Right)?
+                .matmul(&w_t)
+                .map_err(Either::Right)?; // [rank, num_embeddings]
+            let cross = (&bt_wt * &self.a)
+                .map_err(Either::Right)?
+                .sum_keepdim(0)
+                .map_err(Either::Right)?
+                .mul(2.0 * scale_val)
+                .map_err(Either::Right)?; // [1, num_embeddings]
+
+            // ||W^T + scale*BA||² = ||W^T||² + 2*scale*W^T·BA + scale²||BA||²
+            let norms = (w_norm_sq
+                + cross
+                + ba_norm_sq_cols
+                    .mul(scale_val * scale_val)
+                    .map_err(Either::Right)?)
+            .map_err(Either::Right)?
+            .sqrt()
+            .map_err(Either::Right)?; // [1, num_embeddings]
+
+            // Normalized weight: m * (W^T + scaled_BA) / ||W^T + scaled_BA||_2
+            // Compute W^T + scaled_BA
+            let w_plus_ba = (&w_t + &scaled_ba).map_err(Either::Right)?;
+
             let normalized = w_plus_ba
                 .broadcast_div(&norms)
                 .map_err(Either::Right)?
@@ -177,22 +230,83 @@ impl Module for LoraEmbedding {
         } else {
             let scale = self.scale.unwrap();
             if let Some(ref m) = self.m {
-                // DoRA implementation
-                // Calculate W' = W + BA * scale
-                let delta = self.b.matmul(&self.a)?.mul(scale)?;
-                let w_prime = (self.embeddings().t()? + delta)?;
+                // DoRA implementation (memory-efficient, column-wise normalization)
+                // For embeddings: W^T is [embedding_dim, num_embeddings]
+                // DoRA: W' = m * (W^T + scale*BA) / ||W^T + scale*BA||_2
+                // where ||·||_2 is column-wise L2 norm (norm across embedding_dim for each token)
+                // Per DoRA paper Section 3.1: magnitude is computed per embedding (column of W^T)
+                // This mirrors loralinear.rs but adapted for embedding matrix layout
 
-                // Calculate column-wise norm of W'
-                let w_prime_norm = w_prime.sqr()?.sum_keepdim(0)?.sqrt()?;
+                // Note: Standard embedding lookup would give us W@x
+                let result = self.old.forward(input)?;
 
-                // Apply magnitude vector and normalize: m * W' / ||W'||
-                let normalized_weight = w_prime.broadcast_div(&w_prime_norm)?;
-                let scaled_weight = normalized_weight.broadcast_mul(m)?;
+                // Compute adapter contribution using the efficient embedding lookup
+                let b = self.b.t()?;
+                let b = b.reshape(b.shape())?;
+                let after_a = self.embed_a.forward(input)?;
+                let ba_out = after_a.broadcast_matmul(&b)?.mul(scale)?;
 
-                // Transpose back and create embedding (ensure contiguous)
-                let embedding_weight = scaled_weight.t()?.contiguous()?;
-                let embed = Embedding::new(embedding_weight, self.hidden_size());
-                embed.forward(input)
+                // Combined output: W@x + scale*BA@x
+                let combined = (&result + &ba_out)?;
+
+                // Compute column-wise norms of W^T + scale*BA efficiently
+                // WITHOUT materializing the full BA matrix
+                // For each column j: ||W^T_j + scale*BA_j||² = sum_i (W^T_ij + scale*(BA)_ij)²
+                // We use: ||W^T_j + scale*BA_j||² = ||W^T_j||² + 2*scale*W^T_j·(BA)_j + scale²||BA_j||²
+
+                let w_t = self.embeddings().t()?; // [embedding_dim, num_embeddings]
+
+                // Compute ||W^T_j||² for each column (sum over embedding_dim dimension)
+                let w_norm_sq = w_t.sqr()?.sum_keepdim(0)?; // [1, num_embeddings]
+
+                // Compute ||BA_j||² efficiently using the kernel trick
+                // BA = [embedding_dim, num_embeddings]
+                // For column j: ||BA_j||² = sum_i (BA)_ij² = sum_i (sum_k B_ik * A_kj)²
+                // Using kernel trick: (BA_j)^T @ BA_j = A_j^T @ B^T @ B @ A_j
+                let btb = self.b.t()?.matmul(&self.b)?; // [rank, rank]
+                let a_btb = self.a.t()?.matmul(&btb)?; // [num_embeddings, rank]
+                let ba_norm_sq_cols = (&a_btb * &self.a.t()?)?.sum_keepdim(1)?.t()?; // [1, num_embeddings]
+
+                // Compute 2*W^T_j·(BA)_j efficiently
+                // For each column j: W^T_j · (BA)_j = sum_i W^T_ij * (BA)_ij
+                // where (BA)_ij = sum_k B_ik * A_kj
+                // So: sum_i W^T_ij * sum_k B_ik * A_kj = sum_k (sum_i W^T_ij * B_ik) * A_kj
+                //                                       = sum_k (B^T @ W^T)_kj * A_kj
+                //                                       = (B^T @ W^T) ⊙ A summed over k for each column
+                let bt_wt = self.b.t()?.matmul(&w_t)?; // [rank, num_embeddings]
+                let cross = (&bt_wt * &self.a)?.sum_keepdim(0)?.mul(2.0 * scale)?; // [1, num_embeddings]
+
+                // ||W^T + scale*BA||² = ||W^T||² + 2*scale*W^T·BA + scale²||BA||²
+                let norms = (w_norm_sq + cross + ba_norm_sq_cols.mul(scale * scale)?)?
+                    .sqrt()?
+                    .squeeze(0)?; // [num_embeddings]
+
+                // Apply DoRA column-wise: m * combined / norms
+                // For embeddings, we need to apply the normalization per token
+                // m is [embedding_dim, num_embeddings], norms is [num_embeddings]
+                // We need to normalize each embedding vector (column of W^T)
+
+                // Get norms for the input indices by indexing into our precomputed norms
+                // Also index into m to get the magnitude values for selected embeddings
+                let input_indices = input.flatten_all()?;
+                let selected_norms = norms.index_select(&input_indices, 0)?;
+                let selected_m = m.index_select(&input_indices, 1)?.t()?; // m is [embedding_dim, num_embeddings]
+
+                // Normalize: result_normalized = (combined / norms) * m
+                // selected_norms shape: [batch_flattened]
+                // selected_m shape: [batch_flattened, embedding_dim]
+                // combined shape: [batch_shape..., embedding_dim]
+
+                let norm_scale = selected_m.broadcast_div(&selected_norms)?; // [batch_flattened, embedding_dim]
+
+                // Reshape norm_scale to match combined's shape
+                let combined_dims = combined.shape().dims();
+                let mut target_shape = Vec::with_capacity(combined_dims.len());
+                target_shape.extend_from_slice(&combined_dims[..combined_dims.len() - 1]);
+                target_shape.push(self.hidden_size());
+
+                let norm_scale_reshaped = norm_scale.reshape(target_shape.as_slice())?;
+                Ok(combined.broadcast_mul(&norm_scale_reshaped)?)
             } else {
                 // Standard LoRA implementation
                 let mut result = self.old.forward(input)?;

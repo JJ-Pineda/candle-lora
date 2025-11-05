@@ -103,20 +103,60 @@ impl Merge for LoraLinear {
         if let Some(ref m) = self.m {
             let w = self.old.weight();
 
-            // Compute row-wise norms of W + scaled_BA
+            // Compute row-wise norms of W + scaled_BA efficiently
+            // WITHOUT rematerializing BA multiple times
+            // For each row i: ||W_i + scale*BA_i||² = sum_j (W_ij + scale*(BA)_ij)²
+            // We use: ||W_i + scale*BA_i||² = ||W_i||² + 2*scale*W_i·(BA)_i + scale²||BA_i||²
             // DoRA uses row-wise normalization per output channel (Section 3.1)
-            let w_plus_ba = (w + &scaled_ba).map_err(Either::Right)?;
-            let norms = w_plus_ba
+
+            let scale_val = self.scale.unwrap_or(1.0);
+
+            // Compute ||W_i||² for each row (sum over in_features dimension)
+            let w_norm_sq = w
                 .sqr()
                 .map_err(Either::Right)?
-                .sum_keepdim(1) // Row-wise: sum over in_features dimension
+                .sum_keepdim(1)
+                .map_err(Either::Right)?; // [out_features, 1]
+
+            // Compute ||BA_i||² efficiently using the kernel trick
+            // For each row i: ||BA_i||² = (BA)(BA)^T_ii = (B @ A @ A^T @ B^T)_ii
+            let aat = self
+                .ff_a
+                .weight()
+                .matmul(&self.ff_a.weight().t().map_err(Either::Right)?)
+                .map_err(Either::Right)?; // [rank, rank]
+            let b_aat = self.ff_b.weight().matmul(&aat).map_err(Either::Right)?; // [out_features, rank]
+            let ba_norm_sq = (&b_aat * self.ff_b.weight())
                 .map_err(Either::Right)?
-                .sqrt()
+                .sum_keepdim(1)
+                .map_err(Either::Right)?; // [out_features, 1]
+
+            // Compute 2*W_i·(BA)_i efficiently
+            let wa_t = w
+                .matmul(&self.ff_a.weight().t().map_err(Either::Right)?)
+                .map_err(Either::Right)?; // [out_features, rank]
+            let cross = (&wa_t * self.ff_b.weight())
                 .map_err(Either::Right)?
-                .squeeze(1)
-                .map_err(Either::Right)?;
+                .sum_keepdim(1)
+                .map_err(Either::Right)?
+                .mul(2.0 * scale_val)
+                .map_err(Either::Right)?; // [out_features, 1]
+
+            // ||W + scale*BA||² = ||W||² + 2*scale*W·BA + scale²||BA||²
+            let norms = (w_norm_sq
+                + cross
+                + ba_norm_sq
+                    .mul(scale_val * scale_val)
+                    .map_err(Either::Right)?)
+            .map_err(Either::Right)?
+            .sqrt()
+            .map_err(Either::Right)?
+            .squeeze(1)
+            .map_err(Either::Right)?; // [out_features]
 
             // Normalized weight: m * (W + scaled_BA) / ||W + scaled_BA||_2
+            // Still need to compute W + scaled_BA for the final result
+            let w_plus_ba = (w + &scaled_ba).map_err(Either::Right)?;
             let norm_scale = m.broadcast_div(&norms).map_err(Either::Right)?;
             let normalized = w_plus_ba
                 .broadcast_mul(&norm_scale)
@@ -168,13 +208,17 @@ impl Module for LoraLinear {
         if self.merged || self.scale.is_none() {
             self.old.forward(input)
         } else {
-            let mut result = self.old.forward(input)?;
             let scale = self.scale.unwrap();
-            let input_new = if self.dropout.is_some() {
+
+            // Dropout should only be applied to adapter path, not base model
+            let input_adapter = if self.dropout.is_some() {
                 self.dropout.as_ref().unwrap().forward(input, true)?
             } else {
                 input.clone()
             };
+
+            // Store bias to add at the end
+            let bias = self.old.bias();
 
             if let Some(ref m) = self.m {
                 // DoRA implementation (memory-efficient, row-wise normalization)
@@ -182,21 +226,23 @@ impl Module for LoraLinear {
                 // where ||·||_2 is row-wise L2 norm (norm across in_features for each out_feature)
                 // Per DoRA paper Section 3.1: magnitude is computed per output channel (row)
 
-                // Note: `result` already contains W@x from line 169
+                // IMPORTANT: Compute W@x WITHOUT bias and WITHOUT dropout (bias added at the end)
+                let w = self.old.weight(); // [out_features, in_features]
+                let w_linear = Linear::new(w.clone(), None);
+                let w_out = w_linear.forward(input)?; // W@x without bias, using original input
 
-                // Compute adapter output: scale*B@A@x
-                let a_out = self.ff_a.forward(&input_new)?;
+                // Compute adapter output: scale*B@A@x with dropout applied
+                let a_out = self.ff_a.forward(&input_adapter)?;
                 let ba_out = self.ff_b.forward(&a_out)?.mul(scale)?;
 
-                // Combined output: W@x + scale*B@A@x
-                let combined = (&result + &ba_out)?;
+                // Combined output: W@x + scale*B@A@x (still no bias)
+                let combined = (&w_out + &ba_out)?;
 
                 // Compute row-wise norms of W + scale*BA efficiently
                 // WITHOUT materializing the full BA matrix
                 // For each row i: ||W_i + scale*BA_i||² = sum_j (W_ij + scale*(BA)_ij)²
                 // We use: ||W_i + scale*BA_i||² = ||W_i||² + 2*scale*W_i·(BA)_i + scale²||BA_i||²
 
-                let w = self.old.weight(); // [out_features, in_features]
                 let b_weight = self.ff_b.weight(); // [out_features, rank]
                 let a_weight = self.ff_a.weight(); // [rank, in_features]
 
@@ -228,21 +274,33 @@ impl Module for LoraLinear {
                 // m is [out_features], norms is [out_features]
                 // This normalizes each output feature (row) independently
                 let norm_scale = m.broadcast_div(&norms)?; // [out_features]
-                result = combined.broadcast_mul(&norm_scale)?;
+                let mut result = combined.broadcast_mul(&norm_scale)?;
 
-                // Add bias if present
-                if let Some(bias) = self.old.bias() {
-                    result = result.broadcast_add(bias)?;
+                // Add bias at the very end
+                if let Some(b) = bias {
+                    result = result.broadcast_add(b)?;
                 }
+                Ok(result)
             } else {
                 // Standard LoRA implementation
+                // Compute W@x without bias and without dropout
+                let w = self.old.weight();
+                let w_linear = Linear::new(w.clone(), None);
+                let mut result = w_linear.forward(input)?; // Use original input
+
+                // Add adapter output with dropout applied
                 let adapter_out = self
                     .ff_b
-                    .forward(&self.ff_a.forward(&input_new)?)?
+                    .forward(&self.ff_a.forward(&input_adapter)?)?
                     .mul(scale)?;
                 result = (result + adapter_out)?;
+
+                // Add bias at the end
+                if let Some(b) = bias {
+                    result = result.broadcast_add(b)?;
+                }
+                Ok(result)
             }
-            Ok(result)
         }
     }
 }
