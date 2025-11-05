@@ -651,7 +651,8 @@ impl Model {
         sw: Option<usize>,
     ) -> Result<Tensor> {
         let minf = f32::NEG_INFINITY;
-        let mask: Vec<_> = (0..tgt)
+        // Create mask for one batch element
+        let single_mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
                 (0..(tgt + offset)).map(move |j| {
                     let past_ok = j <= i + offset;
@@ -667,6 +668,9 @@ impl Model {
                 })
             })
             .collect();
+
+        // Repeat mask for each batch element
+        let mask: Vec<_> = (0..b).flat_map(|_| single_mask.iter().copied()).collect();
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
