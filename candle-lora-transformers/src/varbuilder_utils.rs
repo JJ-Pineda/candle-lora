@@ -1,11 +1,11 @@
 //! Utilities for creating a VarBuilder from a VarMap loaded from tensor storage formats.
-use std::path::Path;
-
 use candle_core::{DType, Device, Error, Var};
 use candle_nn::{
     var_builder::{SimpleBackend, VarBuilderArgs},
     VarBuilder, VarMap,
 };
+use std::collections::hash_map::Entry;
+use std::path::Path;
 
 use tqdm::Iter;
 
@@ -30,7 +30,13 @@ pub fn from_mmaped_safetensors<'a, P: AsRef<Path>>(
                     .load(&name, device)?
                     .to_device(device)?
                     .to_dtype(dtype)?;
-                ws.insert(verified_name, Var::from_tensor(&tensor)?);
+
+                match ws.entry(verified_name.clone()) {
+                    Entry::Vacant(h) => Ok(h.insert(Var::from_tensor(&tensor)?)),
+                    Entry::Occupied(_) => Err(Error::Msg(format!(
+                        "The tensor {verified_name} already exists!"
+                    ))),
+                }?;
             }
         } else {
             for (name, _) in tensors.tensors().iter().tqdm() {
@@ -39,7 +45,13 @@ pub fn from_mmaped_safetensors<'a, P: AsRef<Path>>(
                     .load(name, device)?
                     .to_device(device)?
                     .to_dtype(dtype)?;
-                ws.insert(verified_name, Var::from_tensor(&tensor)?);
+
+                match ws.entry(verified_name.clone()) {
+                    Entry::Vacant(h) => Ok(h.insert(Var::from_tensor(&tensor)?)),
+                    Entry::Occupied(_) => Err(Error::Msg(format!(
+                        "The tensor {verified_name} already exists!"
+                    ))),
+                }?;
             }
         };
     }

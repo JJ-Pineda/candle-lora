@@ -943,7 +943,7 @@ impl ModelForCausalLM {
 
 /// Wrapper around tokenizers::Tokenizer with padding and decode utilities
 pub struct ModelTokenizer {
-    tokenizer: tokenizers::Tokenizer,
+    tokenizer: Tokenizer,
     padding_token_id: u32,
 }
 
