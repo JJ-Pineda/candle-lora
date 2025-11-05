@@ -66,7 +66,7 @@ impl BertLinear {
         if merge {
             this.get_merged_lora_model(
                 lora_config,
-                &vb.pp("lora_linear"),
+                &vb.pp("lora"),
                 Some(linear_config),
                 None,
                 None,
@@ -75,7 +75,7 @@ impl BertLinear {
         } else {
             this.get_lora_model(
                 lora_config,
-                &vb.pp("lora_linear"),
+                &vb.pp("lora"),
                 Some(linear_config),
                 None,
                 None,
@@ -223,7 +223,7 @@ fn linear(
     let weight = vb.get((size2, size1), "weight")?;
     let bias = vb.get(size2, "bias")?;
     Ok(BertLinear::new(
-        vb.pp("lora_linear"),
+        vb.pp("lora"),
         weight,
         Some(bias),
         merge,

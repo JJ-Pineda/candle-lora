@@ -105,7 +105,7 @@ impl Qwen3MLP {
             &gate_proj_base,
             &gate_proj_config,
             lora_config,
-            &vb.pp("gate_proj.lora_linear"),
+            &vb.pp("gate_proj.lora"),
             gate_proj_id,
         )?;
 
@@ -116,7 +116,7 @@ impl Qwen3MLP {
             &up_proj_base,
             &up_proj_config,
             lora_config,
-            &vb.pp("up_proj.lora_linear"),
+            &vb.pp("up_proj.lora"),
             up_proj_id,
         )?;
 
@@ -128,7 +128,7 @@ impl Qwen3MLP {
             &down_proj_base,
             &down_proj_config,
             lora_config,
-            &vb.pp("down_proj.lora_linear"),
+            &vb.pp("down_proj.lora"),
             down_proj_id,
         )?;
 
@@ -169,7 +169,7 @@ impl Qwen3MLP {
         self.gate_proj.add_adapter(
             &gate_proj_config,
             lora_config,
-            &vb.pp("gate_proj.lora_linear"),
+            &vb.pp("gate_proj.lora"),
             gate_proj_id,
         )?;
 
@@ -178,7 +178,7 @@ impl Qwen3MLP {
         self.up_proj.add_adapter(
             &up_proj_config,
             lora_config,
-            &vb.pp("up_proj.lora_linear"),
+            &vb.pp("up_proj.lora"),
             up_proj_id,
         )?;
 
@@ -187,7 +187,7 @@ impl Qwen3MLP {
         self.down_proj.add_adapter(
             &down_proj_config,
             lora_config,
-            &vb.pp("down_proj.lora_linear"),
+            &vb.pp("down_proj.lora"),
             down_proj_id,
         )?;
 
@@ -275,7 +275,7 @@ impl Qwen3Attention {
             &q_proj_base,
             &q_proj_config,
             lora_config,
-            &vb.pp("q_proj.lora_linear"),
+            &vb.pp("q_proj.lora"),
             q_proj_id,
         )?;
 
@@ -287,7 +287,7 @@ impl Qwen3Attention {
             &k_proj_base,
             &k_proj_config,
             lora_config,
-            &vb.pp("k_proj.lora_linear"),
+            &vb.pp("k_proj.lora"),
             k_proj_id,
         )?;
 
@@ -299,7 +299,7 @@ impl Qwen3Attention {
             &v_proj_base,
             &v_proj_config,
             lora_config,
-            &vb.pp("v_proj.lora_linear"),
+            &vb.pp("v_proj.lora"),
             v_proj_id,
         )?;
 
@@ -310,7 +310,7 @@ impl Qwen3Attention {
             &o_proj_base,
             &o_proj_config,
             lora_config,
-            &vb.pp("o_proj.lora_linear"),
+            &vb.pp("o_proj.lora"),
             o_proj_id,
         )?;
 
@@ -385,7 +385,7 @@ impl Qwen3Attention {
         self.q_proj.add_adapter(
             &q_proj_config,
             lora_config,
-            &vb.pp("q_proj.lora_linear"),
+            &vb.pp("q_proj.lora"),
             q_proj_id,
         )?;
 
@@ -394,7 +394,7 @@ impl Qwen3Attention {
         self.k_proj.add_adapter(
             &k_proj_config,
             lora_config,
-            &vb.pp("k_proj.lora_linear"),
+            &vb.pp("k_proj.lora"),
             k_proj_id,
         )?;
 
@@ -403,7 +403,7 @@ impl Qwen3Attention {
         self.v_proj.add_adapter(
             &v_proj_config,
             lora_config,
-            &vb.pp("v_proj.lora_linear"),
+            &vb.pp("v_proj.lora"),
             v_proj_id,
         )?;
 
@@ -412,7 +412,7 @@ impl Qwen3Attention {
         self.o_proj.add_adapter(
             &o_proj_config,
             lora_config,
-            &vb.pp("o_proj.lora_linear"),
+            &vb.pp("o_proj.lora"),
             o_proj_id,
         )?;
 

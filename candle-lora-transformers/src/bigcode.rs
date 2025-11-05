@@ -59,7 +59,7 @@ fn linear(
     if merge {
         this.get_merged_lora_model(
             lora_config,
-            &vb.pp("lora_linear"),
+            &vb.pp("lora"),
             Some(linear_config),
             None,
             None,
@@ -68,7 +68,7 @@ fn linear(
     } else {
         this.get_lora_model(
             lora_config,
-            &vb.pp("lora_linear"),
+            &vb.pp("lora"),
             Some(linear_config),
             None,
             None,
