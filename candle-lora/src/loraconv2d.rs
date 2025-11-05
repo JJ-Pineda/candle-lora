@@ -220,11 +220,10 @@ impl Merge for LoraConv2d {
 
 impl Module for LoraConv2d {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if self.merged {
-            return self.old.forward(input);
-        }
-
-        if let Some(scale) = self.scale {
+        if self.merged || self.scale.is_none() {
+            self.old.forward(input)
+        } else {
+            let scale = self.scale.unwrap();
             let mut a_input = input.clone();
             if self.dropout.is_some() {
                 a_input = self.dropout.as_ref().unwrap().forward(input, true)?;
@@ -268,8 +267,6 @@ impl Module for LoraConv2d {
                 let tmp = self.b_conv.forward(&self.a_conv.forward(&a_input)?)?;
                 &weight + tmp.mul(scale)?
             }
-        } else {
-            self.old.forward(input)
         }
     }
 }

@@ -178,11 +178,10 @@ impl Merge for LoraConv1d {
 
 impl Module for LoraConv1d {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if self.merged {
-            return self.old.forward(input);
-        }
-
-        if let Some(scale) = self.scale {
+        if self.merged || self.scale.is_none() {
+            self.old.forward(input)
+        } else {
+            let scale = self.scale.unwrap();
             let bias = self.bias().cloned();
 
             let mut weight = self.old.weight().clone();
@@ -221,8 +220,6 @@ impl Module for LoraConv1d {
                 let conv = Conv1d::new(weight, bias, *self.config());
                 conv.forward(input)
             }
-        } else {
-            self.old.forward(input)
         }
     }
 }

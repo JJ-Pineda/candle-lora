@@ -159,7 +159,7 @@ impl MultiLoraLinear {
 
 impl Module for MultiLoraLinear {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if self.ff_a.is_empty() || self.active_adapter.is_none() {
+        if self.adapters.is_empty() || self.active_adapter.is_none() {
             self.old.forward(input)
         } else {
             // We ensure that the "active_adapter" always exists otherwise it's None

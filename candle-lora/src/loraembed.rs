@@ -172,9 +172,12 @@ impl Merge for LoraEmbedding {
 
 impl Module for LoraEmbedding {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if let Some(ref m) = self.m {
-            // DoRA implementation
-            if let Some(scale) = self.scale {
+        if self.merged || self.scale.is_none() {
+            self.old.forward(input)
+        } else {
+            let scale = self.scale.unwrap();
+            if let Some(ref m) = self.m {
+                // DoRA implementation
                 // Calculate W' = W + BA * scale
                 let delta = self.b.matmul(&self.a)?.mul(scale)?;
                 let w_prime = (self.embeddings().t()? + delta)?;
@@ -191,19 +194,15 @@ impl Module for LoraEmbedding {
                 let embed = Embedding::new(embedding_weight, self.hidden_size());
                 embed.forward(input)
             } else {
-                self.old.forward(input)
-            }
-        } else {
-            // Standard LoRA implementation
-            let mut result = self.old.forward(input)?;
-            if let Some(scale) = self.scale {
+                // Standard LoRA implementation
+                let mut result = self.old.forward(input)?;
                 let b = self.b.t()?;
                 let b = b.reshape(b.shape())?;
 
                 let after_a = self.embed_a.forward(input)?;
-                result = (result + (after_a.broadcast_matmul(&b)?).mul(scale))?
+                result = (result + (after_a.broadcast_matmul(&b)?).mul(scale))?;
+                Ok(result)
             }
-            Ok(result)
         }
     }
 }
