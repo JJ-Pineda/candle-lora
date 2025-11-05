@@ -3,6 +3,7 @@ use candle_lora::{LoraConfig, LoraLinearConfig, MultiLoraLinear};
 use candle_nn::{kv_cache::KvCache, linear_no_bias, Activation, Linear, VarBuilder};
 use candle_transformers::generation::LogitsProcessor;
 use std::sync::{Arc, RwLock};
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -829,17 +830,6 @@ impl ModelForCausalLM {
         (*guard).clear_kv_cache();
     }
 
-    fn strip_padding(&self, ids: Vec<Vec<u32>>, padding_token_id: u32) -> Vec<Vec<u32>> {
-        ids.iter()
-            .map(|v| {
-                v.iter()
-                    .filter(|&&id| id != padding_token_id)
-                    .copied()
-                    .collect()
-            })
-            .collect()
-    }
-
     pub fn forward(
         &self,
         input: &Tensor,
@@ -864,7 +854,6 @@ impl ModelForCausalLM {
     ) -> Result<Vec<Vec<u32>>> {
         // Configuration
         let eos_token_id: u32 = 151643;
-        let padding_token_id: u32 = 151654;
         let max_tokens = max_new_tokens.unwrap_or(512);
 
         // Get device without holding lock
@@ -873,17 +862,24 @@ impl ModelForCausalLM {
             guard.device.clone()
         };
 
-        // Pad input sequences to same length
+        // Assume input is already padded to rectangular shape
         let rows = input_ids.len();
-        let cols = input_ids.iter().map(|r| r.len()).max().unwrap_or(0);
-        let mut ids = input_ids
-            .iter()
-            .map(|seq| {
-                let mut padded_seq = vec![padding_token_id; cols - seq.len()];
-                padded_seq.extend(*seq);
-                padded_seq
-            })
-            .collect::<Vec<_>>();
+        let cols = input_ids.first().map(|r| r.len()).unwrap_or(0);
+
+        // Verify all rows have the same length (rectangular input)
+        for (i, row) in input_ids.iter().enumerate() {
+            if row.len() != cols {
+                return Err(Error::Msg(format!(
+                    "Input must be rectangular: row {} has length {} but expected {}",
+                    i,
+                    row.len(),
+                    cols
+                )));
+            }
+        }
+
+        // Convert to owned Vec<Vec<u32>>
+        let mut ids: Vec<Vec<u32>> = input_ids.iter().map(|row| row.to_vec()).collect();
 
         // Initialize generation state
         let mut lp = LogitsProcessor::new(seed.unwrap_or(42), temperature, top_p);
@@ -939,8 +935,90 @@ impl ModelForCausalLM {
             }
         }
 
-        // Cleanup and return
+        // Cleanup and return without stripping padding
         self.clear_kv_cache();
-        Ok(self.strip_padding(ids, padding_token_id))
+        Ok(ids)
+    }
+}
+
+/// Wrapper around tokenizers::Tokenizer with padding and decode utilities
+pub struct ModelTokenizer {
+    tokenizer: tokenizers::Tokenizer,
+    padding_token_id: u32,
+}
+
+impl ModelTokenizer {
+    pub fn new(tokenizer_path: &str, padding_token_id: u32) -> Result<Self> {
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| Error::Msg(format!("Failed to load tokenizer config file: {e}")))?;
+
+        Ok(Self {
+            tokenizer,
+            padding_token_id,
+        })
+    }
+
+    pub fn encode(&self, texts: Vec<&str>, padding: Option<&str>) -> Result<Vec<Vec<u32>>> {
+        // Encode all texts
+        let mut encoded: Vec<Vec<u32>> = Vec::new();
+        for text in texts {
+            let encoding = self
+                .tokenizer
+                .encode(text, true)
+                .map_err(|e| Error::Msg(format!("Tokenization error: {e}")))?;
+            encoded.push(encoding.get_ids().to_vec());
+        }
+
+        // Apply padding if requested
+        match padding {
+            Some("left") => {
+                let max_len = encoded.iter().map(|v| v.len()).max().unwrap_or(0);
+                Ok(encoded
+                    .into_iter()
+                    .map(|mut seq| {
+                        let pad_len = max_len - seq.len();
+                        let mut padded = vec![self.padding_token_id; pad_len];
+                        padded.append(&mut seq);
+                        padded
+                    })
+                    .collect())
+            }
+            Some("right") => {
+                let max_len = encoded.iter().map(|v| v.len()).max().unwrap_or(0);
+                Ok(encoded
+                    .into_iter()
+                    .map(|mut seq| {
+                        seq.resize(max_len, self.padding_token_id);
+                        seq
+                    })
+                    .collect())
+            }
+            None => Ok(encoded),
+            Some(other) => Err(Error::Msg(format!(
+                "Invalid padding direction: '{other}'. Use 'left', 'right', or None",
+            ))),
+        }
+    }
+
+    pub fn decode(&self, token_ids: Vec<Vec<u32>>, remove_padding: bool) -> Result<Vec<String>> {
+        let mut decoded = Vec::new();
+
+        for ids in token_ids {
+            let clean_ids = if remove_padding {
+                ids.into_iter()
+                    .filter(|&id| id != self.padding_token_id)
+                    .collect::<Vec<_>>()
+            } else {
+                ids
+            };
+
+            let text = self
+                .tokenizer
+                .decode(&clean_ids, true)
+                .map_err(|e| Error::Msg(format!("Decoding error: {e}")))?;
+            decoded.push(text);
+        }
+
+        Ok(decoded)
     }
 }

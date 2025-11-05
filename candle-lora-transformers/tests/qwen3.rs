@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_lora::LoraConfig;
-use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM};
+use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM, ModelTokenizer};
 use candle_lora_transformers::varbuilder_utils::from_mmaped_safetensors;
 use std::sync::{Arc, RwLock};
-use tokenizers::Tokenizer;
 
 fn get_device_and_dtype() -> (Device, DType) {
     if let Ok(device) = Device::new_cuda(0) {
@@ -43,20 +42,6 @@ fn build_prompt(msg: &str) -> String {
     format!("<|im_start|>user\n\n{msg}\n\n<|im_start|>assistant\n\n<think>\n\n</think>")
 }
 
-fn tokens_to_string(tokenizer: &Tokenizer, ids: &[u32]) -> Result<Option<String>> {
-    // Many tokenizers can decode one id at a time, but some BPEs produce
-    // leading spaces/special joins. This is fine for a test; we only need
-    // a minimal check that it resembles text.
-    let s = tokenizer
-        .decode(ids, /*skip_special_tokens=*/ true)
-        .map_err(anyhow::Error::msg)?;
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(s))
-    }
-}
-
 #[test]
 fn test_qwen3() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -70,7 +55,9 @@ fn test_qwen3() -> Result<()> {
     let cfg_file = std::fs::File::open(&cfg_path)
         .with_context(|| format!("opening config json at {cfg_path}"))?;
     let cfg: Config = serde_json::from_reader(cfg_file)?;
-    let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Create TokenizerWrapper with Qwen3 padding token
+    let tokenizer = ModelTokenizer::new(&tok_path, 151654)?;
 
     // --- Load base weights separately for comparison ---
     let base_weight_files = collect_safetensors(&base_dir)?;
@@ -82,16 +69,15 @@ fn test_qwen3() -> Result<()> {
     let model = Arc::new(RwLock::new(Model::new(&cfg, vb.clone(), default_lora_cfg)?));
     let mut model = ModelForCausalLM::from_base(Arc::clone(&model), &cfg, vb)?;
 
-    // --- Tiny generation loop (greedy / top-p+temp) ---
+    // --- Prepare prompts and encode with left padding ---
     let msgs = vec!["Hello, who are you?", "What is 2+2?"];
-    let ids_vec = msgs
-        .into_iter()
-        .map(|m| {
-            let prompt = build_prompt(m);
-            let enc = tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?;
-            Ok(enc.get_ids().to_vec())
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let prompts: Vec<String> = msgs.iter().map(|m| build_prompt(m)).collect();
+    let prompt_refs: Vec<&str> = prompts.iter().map(|s| s.as_str()).collect();
+
+    // Encode with left padding
+    let ids_vec = tokenizer
+        .encode(prompt_refs, Some("left"))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ids: Vec<&[u32]> = ids_vec.iter().map(|v| v.as_slice()).collect();
 
     let logits_base = run_logits(&mut model, ids[0], &device)?.to_dtype(DType::F32)?;
@@ -118,14 +104,18 @@ fn test_qwen3() -> Result<()> {
     // Verify both sequences generated output
     anyhow::ensure!(output_ids.len() == 2, "Expected 2 generated sequences");
 
-    for (i, output) in output_ids.iter().enumerate() {
-        let generated_text = tokens_to_string(&tokenizer, output)?.unwrap();
+    // Decode with padding removal
+    let generated_texts = tokenizer
+        .decode(output_ids, true)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    for (i, text) in generated_texts.iter().enumerate() {
         anyhow::ensure!(
-            generated_text.trim().len() >= 1,
+            text.trim().len() >= 1,
             "Model produced empty output text for sequence {}",
             i
         );
-        println!("Sequence {}: {}", i, generated_text);
+        println!("Sequence {}: {}", i, text);
     }
 
     Ok(())
