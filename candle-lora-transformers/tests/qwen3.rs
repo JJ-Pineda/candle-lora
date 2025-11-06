@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Error, Tensor};
 use candle_lora::LoraConfig;
 use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM, ModelTokenizer};
-use candle_lora_transformers::varbuilder_utils::from_mmaped_safetensors;
+use candle_lora_transformers::varbuilder_utils::{from_mmaped_safetensors, from_pth_tensors};
+use candle_nn::VarBuilder;
 use std::sync::{Arc, RwLock};
+use tokenizers::Tokenizer;
 
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -50,7 +52,11 @@ fn build_prompt(msg: &str) -> String {
 }
 
 /// Loads the base model config and VarBuilder from disk
-fn get_base_vb(base_dir: &str, device: &Device, dtype: DType) -> Result<(Config, VarBuilder)> {
+fn get_base_vb<'a>(
+    base_dir: &'a str,
+    device: &'a Device,
+    dtype: DType,
+) -> Result<(Config, VarBuilder<'a>)> {
     let cfg_path = format!("{}/config.json", base_dir);
     let cfg_file = std::fs::File::open(&cfg_path)
         .with_context(|| format!("opening config json at {cfg_path}"))?;
@@ -157,6 +163,93 @@ fn test_qwen3_generation(tokenizer: &ModelTokenizer, mut model: ModelForCausalLM
     Ok(())
 }
 
+/// Test regression model
+fn test_qwen3_regression(
+    model: &Arc<RwLock<Model>>,
+    tokenizer: &ModelTokenizer,
+    cfg: &Config,
+    path: &str,
+    device: &Device,
+    dtype: DType,
+) -> Result<()> {
+    struct PriceBot {
+        pub base: Arc<RwLock<Model>>,
+        head: Vec<Tensor>,
+    }
+
+    impl PriceBot {
+        fn from_base(cfg: &Config, base: &Arc<RwLock<Model>>, vb: VarBuilder) -> Result<Self> {
+            let split_linear_a = if vb.contains_tensor("split_linear_a.weight") {
+                vb.pp("split_linear_a")
+                    .get((1, cfg.hidden_size), "weight")?
+            } else {
+                return Err(anyhow::Error::msg(
+                    "Failed to find tensor 'split_linear_a'".to_string(),
+                ));
+            };
+
+            let split_linear_b = if vb.contains_tensor("split_linear_b.weight") {
+                vb.pp("split_linear_b")
+                    .get((1, cfg.hidden_size), "weight")?
+            } else {
+                return Err(anyhow::Error::msg(
+                    "Failed to find tensor 'split_linear_b'".to_string(),
+                ));
+            };
+
+            Ok(Self {
+                base: Arc::clone(base),
+                head: vec![split_linear_a, split_linear_b],
+            })
+        }
+
+        fn forward(
+            &self,
+            input: &Tensor,
+            padding_mask: Option<&Tensor>,
+        ) -> candle_core::Result<Tensor> {
+            let (b, l) = input.dims2()?;
+            let hidden_state = {
+                let mut guard = self.base.write().unwrap();
+                let state = guard
+                    .forward(input, 0, padding_mask)?
+                    .narrow(1, l - 1, 1)?
+                    .squeeze(1)?;
+                guard.clear_kv_cache();
+                state
+            };
+
+            let out_tensors = self
+                .head
+                .iter()
+                .map(|t| {
+                    hidden_state
+                        .matmul(t.unsqueeze(0)?)
+                        .map_err(Error::Msg("".to_string()))
+                })
+                .collect::<Result<Vec<Tensor>, Error>>()?;
+
+            Tensor::stack(&out_tensors, 1)
+        }
+    }
+
+    let vb = from_pth_tensors(path, dtype, device, true)?;
+    let price_bot = PriceBot::from_base(&cfg, model, vb)?;
+
+    let test_items = vec!["Request for Half Leukopak from Healthy Donors for Non-Sensitive Genetic Research\n\nItem #022 - Leukopheresis."];
+    let input_ids = tokenizer
+        .encode(test_items, Some("left"))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let input_tensor = Tensor::new(input_ids, device)?;
+
+    let output = price_bot.forward(&input_tensor, None)?;
+
+    println!("{:?}", output);
+
+    Ok(())
+}
+
 /// Composite test that runs both DoRA and generation tests
 #[test]
 fn test_qwen3() -> Result<()> {
@@ -175,18 +268,29 @@ fn test_qwen3() -> Result<()> {
     // Create ModelForCausalLM using new
     let temp_lora_cfg = LoraConfig::new(8, 16.0, None);
     let model = ModelForCausalLM::new(&cfg, vb.clone(), temp_lora_cfg)?;
-    test_qwen3_dora(
+    // test_qwen3_dora(
+    //     &tokenizer,
+    //     &device,
+    //     dtype,
+    //     &cfg,
+    //     Arc::clone(&model.base),
+    //     vb.clone(),
+    //     &adapter_dir,
+    // )?;
+
+    // // Test 2: Text generation with new
+    // test_qwen3_generation(&tokenizer, model)?;
+
+    // Test 3: Regression
+    let reg_head_path = format!("{adapter_dir}/final_layer.pth");
+    test_qwen3_regression(
+        &model.base,
         &tokenizer,
+        &cfg,
+        &reg_head_path,
         &device,
         dtype,
-        &cfg,
-        Arc::clone(&model.base),
-        vb.clone(),
-        &adapter_dir,
     )?;
-
-    // Test 2: Text generation with new
-    test_qwen3_generation(&tokenizer, model)?;
 
     Ok(())
 }
