@@ -3,7 +3,6 @@ use candle_core::{DType, Device, Tensor};
 use candle_lora::LoraConfig;
 use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM, ModelTokenizer};
 use candle_lora_transformers::varbuilder_utils::from_mmaped_safetensors;
-use candle_nn::var_builder::{SimpleBackend, VarBuilderArgs};
 use std::sync::{Arc, RwLock};
 
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -51,11 +50,7 @@ fn build_prompt(msg: &str) -> String {
 }
 
 /// Loads the base model config and VarBuilder from disk
-fn get_base_vb(
-    base_dir: &str,
-    device: &Device,
-    dtype: DType,
-) -> Result<(Config, VarBuilderArgs<'static, Box<dyn SimpleBackend>>)> {
+fn get_base_vb(base_dir: &str, device: &Device, dtype: DType) -> Result<(Config, VarBuilder)> {
     let cfg_path = format!("{}/config.json", base_dir);
     let cfg_file = std::fs::File::open(&cfg_path)
         .with_context(|| format!("opening config json at {cfg_path}"))?;
@@ -84,15 +79,12 @@ fn test_qwen3_dora(
     device: &Device,
     dtype: DType,
     cfg: &Config,
-    vb: VarBuilderArgs<'static, Box<dyn SimpleBackend>>,
+    model: Arc<RwLock<Model>>,
+    vb: VarBuilder,
     adapter_dir: &str,
 ) -> Result<()> {
     println!("\n=== Testing DoRA adapter (using ModelForCausalLM::from_base) ===");
     println!("Using device: {:?}, dtype: {:?}", device, dtype);
-
-    // Create base model with a temporary LoraConfig (required for initialization)
-    let temp_lora_cfg = LoraConfig::new(8, 16.0, None);
-    let model = Arc::new(RwLock::new(Model::new(cfg, vb.clone(), temp_lora_cfg)?));
 
     // Create ModelForCausalLM using from_base (this tests from_base method)
     let mut model = ModelForCausalLM::from_base(model, cfg, vb)?;
@@ -130,19 +122,8 @@ fn test_qwen3_dora(
 }
 
 /// Tests text generation using ModelForCausalLM::new
-fn test_qwen3_generation(
-    tokenizer: &ModelTokenizer,
-    device: &Device,
-    dtype: DType,
-    cfg: &Config,
-    vb: VarBuilderArgs<'static, Box<dyn SimpleBackend>>,
-) -> Result<()> {
-    println!("\n=== Testing text generation (using ModelForCausalLM::new) ===");
-    println!("Using device: {:?}, dtype: {:?}", device, dtype);
-
-    // Create ModelForCausalLM using new (this tests new method)
-    let temp_lora_cfg = LoraConfig::new(8, 16.0, None);
-    let mut model = ModelForCausalLM::new(cfg, vb, temp_lora_cfg)?;
+fn test_qwen3_generation(tokenizer: &ModelTokenizer, mut model: ModelForCausalLM) -> Result<()> {
+    println!("\n=== Testing text generation ===");
 
     // Get test inputs
     let ids_vec = get_test_ids(&["Hello, who are you?", "What is 2+2?"], tokenizer)?;
@@ -191,12 +172,21 @@ fn test_qwen3() -> Result<()> {
     let (cfg, vb) = get_base_vb(&base_dir, &device, dtype)?;
 
     // Test 1: DoRA adapter with from_base
-    test_qwen3_dora(&tokenizer, &device, dtype, &cfg, vb.clone(), &adapter_dir)?;
+    // Create ModelForCausalLM using new
+    let temp_lora_cfg = LoraConfig::new(8, 16.0, None);
+    let model = ModelForCausalLM::new(&cfg, vb.clone(), temp_lora_cfg)?;
+    test_qwen3_dora(
+        &tokenizer,
+        &device,
+        dtype,
+        &cfg,
+        Arc::clone(&model.base),
+        vb.clone(),
+        &adapter_dir,
+    )?;
 
     // Test 2: Text generation with new
-    // Note: Need to reload VarBuilder for second test to avoid borrow issues
-    let (cfg, vb) = get_base_vb(&base_dir, &device, dtype)?;
-    test_qwen3_generation(&tokenizer, &device, dtype, &cfg, vb)?;
+    test_qwen3_generation(&tokenizer, model)?;
 
     Ok(())
 }
