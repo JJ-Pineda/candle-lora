@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Error, Tensor};
+use candle_core::{DType, Device, Error, Module, Tensor};
 use candle_lora::LoraConfig;
 use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM, ModelTokenizer};
 use candle_lora_transformers::varbuilder_utils::{from_mmaped_safetensors, from_pth_tensors};
@@ -218,29 +218,24 @@ fn test_qwen3_regression(
                     .narrow(1, seq_len - 1, 1)?
                     .squeeze(1)?;
                 guard.clear_kv_cache();
-                state
+                state.contiguous()?
             };
 
-            // Apply regression head: [batch, hidden] @ [out_features, hidden].t() = [batch, out_features]
-            // Use element-wise operations: multiply each row of hidden_state by each row of head, then sum
-            let (batch_size, hidden_dim) = hidden_state.dims2()?;
-            let (out_features, _) = self.head.dims2()?;
+            // Apply each linear layer in parallel to hidden_state and concatenate results
+            // Note: hidden_state must be contiguous for linear layers to work correctly
+            let mut outputs = Vec::new();
+            for linear in &self.head {
+                let output = linear.forward(&hidden_state)?;
+                outputs.push(output);
+            }
 
-            // Reshape head to [out_features, 1, hidden_dim] and hidden_state to [1, batch, hidden_dim]
-            // Then multiply and sum across last dimension
-            let head_expanded =
-                self.head
-                    .unsqueeze(1)?
-                    .broadcast_as((out_features, batch_size, hidden_dim))?;
-            let hidden_expanded =
-                hidden_state
-                    .unsqueeze(0)?
-                    .broadcast_as((out_features, batch_size, hidden_dim))?;
-
-            // Element-wise multiply: [out_features, batch, hidden_dim] * [out_features, batch, hidden_dim]
-            let weighted = (&hidden_expanded * &head_expanded)?;
-            // Sum across hidden dimension: [out_features, batch, hidden_dim] -> [out_features, batch]
-            let output = weighted.sum(2)?.t()?; // [out_features, batch] -> [batch, out_features]
+            // Concatenate all outputs along dimension 1
+            let output = if outputs.len() > 1 {
+                let output_refs: Vec<&Tensor> = outputs.iter().collect();
+                Tensor::cat(&output_refs, 1)?
+            } else {
+                outputs.into_iter().next().unwrap()
+            };
 
             self.price_conversion(&output)
                 .map_err(|e| Error::Msg(format!("{e}")))
@@ -284,17 +279,20 @@ fn test_qwen3_regression(
     let price_mu_vec = price_mu.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     let price_sigma_vec = price_sigma.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
+    println!("{:?}", price_mu_vec);
+    println!("{:?}", price_sigma_vec);
+
     let first_price_mu = price_mu_vec[0];
     let first_price_sigma = price_sigma_vec[0];
-    // anyhow::ensure!(
-    //     (first_price_mu > 1000f32) && (first_price_mu < 2000f32),
-    //     "Price mu prediction {first_price_mu} is outside of expected range",
-    // );
+    anyhow::ensure!(
+        (first_price_mu > 1000f32) && (first_price_mu < 2000f32),
+        "Price mu prediction {first_price_mu} is outside of expected range",
+    );
 
-    // anyhow::ensure!(
-    //     (first_price_sigma > 300f32) && (first_price_sigma < 400f32),
-    //     "Price sigma prediction {first_price_sigma} is outside of expected range"
-    // );
+    anyhow::ensure!(
+        (first_price_sigma > 300f32) && (first_price_sigma < 400f32),
+        "Price sigma prediction {first_price_sigma} is outside of expected range"
+    );
 
     Ok(())
 }
