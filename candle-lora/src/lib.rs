@@ -108,6 +108,7 @@ pub struct LoraConfig {
     alpha: f64,
     dropout: Option<f32>,
     pub name: String,
+    pub id: usize,
 }
 
 impl LoraConfig {
@@ -121,15 +122,23 @@ impl LoraConfig {
             alpha,
             dropout,
             name: "lora0".to_string(),
+            id: 0,
         }
     }
 
-    pub fn new_with_name(rank: usize, alpha: f64, dropout: Option<f32>, name: &str) -> Self {
+    pub fn new_no_default(
+        rank: usize,
+        alpha: f64,
+        dropout: Option<f32>,
+        name: &str,
+        id: usize,
+    ) -> Self {
         Self {
             rank,
             alpha,
             dropout,
             name: name.to_string(),
+            id,
         }
     }
 }

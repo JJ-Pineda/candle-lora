@@ -87,10 +87,8 @@ fn test_qwen3_dora(
     cfg: &Config,
     model: Arc<RwLock<Model>>,
     vb: VarBuilder,
-    adapter_dir: &str,
 ) -> Result<()> {
-    println!("\n=== Testing DoRA adapter (using ModelForCausalLM::from_base) ===");
-    println!("Using device: {:?}, dtype: {:?}", device, dtype);
+    println!("\n=== Testing DoRA adapter ===");
 
     // Create ModelForCausalLM using from_base (this tests from_base method)
     let mut model = ModelForCausalLM::from_base(model, cfg, vb)?;
@@ -102,13 +100,6 @@ fn test_qwen3_dora(
     // Run forward pass with base model (no adapter)
     println!("Running inference with base model...");
     let logits_base = run_logits(&mut model, ids[0], device)?.to_dtype(DType::F32)?;
-
-    // Load DoRA adapter
-    println!("Loading DoRA adapter...");
-    let adapter_files = collect_safetensors(adapter_dir)?;
-    let adapter_vb = from_mmaped_safetensors(&adapter_files, dtype, device, false)?;
-    let dora_cfg = LoraConfig::new_with_name(256, 512.0, None, "dora0");
-    model.add_adapter(cfg, adapter_vb, &dora_cfg)?;
 
     // Activate adapter and run forward pass
     println!("Activating adapter and running inference...");
@@ -246,6 +237,11 @@ fn test_qwen3_regression(
         }
     }
 
+    {
+        let mut guard = model.write().unwrap();
+        guard.activate_adapter(Some("dora0"))?;
+    }
+
     let vb = from_pth_tensors(path, dtype, device, true)?;
     let price_bot = PriceBot::from_base(&cfg, model, vb)?;
 
@@ -294,7 +290,11 @@ fn test_qwen3() -> Result<()> {
     // Test 1: DoRA adapter with from_base
     // Create ModelForCausalLM using new
     let temp_lora_cfg = LoraConfig::new(8, 16.0, None);
-    let model = ModelForCausalLM::new(&cfg, vb.clone(), temp_lora_cfg)?;
+    let mut model = ModelForCausalLM::new(&cfg, vb.clone(), temp_lora_cfg)?;
+    let adapter_files = collect_safetensors(&adapter_dir)?;
+    let adapter_vb = from_mmaped_safetensors(&adapter_files, dtype, &device, false)?;
+    let dora_cfg = LoraConfig::new_no_default(256, 512.0, None, "dora0", 0);
+    model.add_adapter(&cfg, adapter_vb, &dora_cfg)?;
     // test_qwen3_dora(
     //     &tokenizer,
     //     &device,

@@ -101,36 +101,30 @@ impl Qwen3MLP {
         let gate_proj_base =
             candle_nn::linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
         let gate_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
-        let gate_proj_id = 0;
         let gate_proj = MultiLoraLinear::new(
             &gate_proj_base,
             &gate_proj_config,
             lora_config,
             &vb.pp("gate_proj.lora"),
-            gate_proj_id,
         )?;
 
         let up_proj_base = candle_nn::linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
         let up_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
-        let up_proj_id = 0;
         let up_proj = MultiLoraLinear::new(
             &up_proj_base,
             &up_proj_config,
             lora_config,
             &vb.pp("up_proj.lora"),
-            up_proj_id,
         )?;
 
         let down_proj_base =
             candle_nn::linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
         let down_proj_config = LoraLinearConfig::new(intermediate_sz, hidden_sz);
-        let down_proj_id = 0;
         let down_proj = MultiLoraLinear::new(
             &down_proj_base,
             &down_proj_config,
             lora_config,
             &vb.pp("down_proj.lora"),
-            down_proj_id,
         )?;
 
         // Verify whether gate, up, or down projection actually found an adapter
@@ -166,31 +160,16 @@ impl Qwen3MLP {
         let intermediate_sz = cfg.intermediate_size;
 
         let gate_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
-        let gate_proj_id = 0;
-        self.gate_proj.add_adapter(
-            &gate_proj_config,
-            lora_config,
-            &vb.pp("gate_proj.lora"),
-            gate_proj_id,
-        )?;
+        self.gate_proj
+            .add_adapter(&gate_proj_config, lora_config, &vb.pp("gate_proj.lora"))?;
 
         let up_proj_config = LoraLinearConfig::new(hidden_sz, intermediate_sz);
-        let up_proj_id = 0;
-        self.up_proj.add_adapter(
-            &up_proj_config,
-            lora_config,
-            &vb.pp("up_proj.lora"),
-            up_proj_id,
-        )?;
+        self.up_proj
+            .add_adapter(&up_proj_config, lora_config, &vb.pp("up_proj.lora"))?;
 
         let down_proj_config = LoraLinearConfig::new(intermediate_sz, hidden_sz);
-        let down_proj_id = 0;
-        self.down_proj.add_adapter(
-            &down_proj_config,
-            lora_config,
-            &vb.pp("down_proj.lora"),
-            down_proj_id,
-        )?;
+        self.down_proj
+            .add_adapter(&down_proj_config, lora_config, &vb.pp("down_proj.lora"))?;
 
         if self.gate_proj.adapters.contains(&lora_config.name)
             || self.up_proj.adapters.contains(&lora_config.name)
@@ -271,48 +250,40 @@ impl Qwen3Attention {
 
         let q_proj_base = candle_nn::linear_no_bias(hidden_size, hidden_size, vb.pp("q_proj"))?;
         let q_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
-        let q_proj_id = 0;
         let q_proj = MultiLoraLinear::new(
             &q_proj_base,
             &q_proj_config,
             lora_config,
             &vb.pp("q_proj.lora"),
-            q_proj_id,
         )?;
 
         let k_proj_base =
             candle_nn::linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
         let k_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
-        let k_proj_id = 0;
         let k_proj = MultiLoraLinear::new(
             &k_proj_base,
             &k_proj_config,
             lora_config,
             &vb.pp("k_proj.lora"),
-            k_proj_id,
         )?;
 
         let v_proj_base =
             candle_nn::linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let v_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
-        let v_proj_id = 0;
         let v_proj = MultiLoraLinear::new(
             &v_proj_base,
             &v_proj_config,
             lora_config,
             &vb.pp("v_proj.lora"),
-            v_proj_id,
         )?;
 
         let o_proj_base = candle_nn::linear_no_bias(hidden_size, hidden_size, vb.pp("o_proj"))?;
         let o_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
-        let o_proj_id = 0;
         let o_proj = MultiLoraLinear::new(
             &o_proj_base,
             &o_proj_config,
             lora_config,
             &vb.pp("o_proj.lora"),
-            o_proj_id,
         )?;
 
         let (adapters, active_adapter) = if q_proj.adapters.contains(&lora_config.name)
@@ -382,40 +353,20 @@ impl Qwen3Attention {
         let hidden_size = head_dim * num_heads;
 
         let q_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
-        let q_proj_id = 0;
-        self.q_proj.add_adapter(
-            &q_proj_config,
-            lora_config,
-            &vb.pp("q_proj.lora"),
-            q_proj_id,
-        )?;
+        self.q_proj
+            .add_adapter(&q_proj_config, lora_config, &vb.pp("q_proj.lora"))?;
 
         let k_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
-        let k_proj_id = 0;
-        self.k_proj.add_adapter(
-            &k_proj_config,
-            lora_config,
-            &vb.pp("k_proj.lora"),
-            k_proj_id,
-        )?;
+        self.k_proj
+            .add_adapter(&k_proj_config, lora_config, &vb.pp("k_proj.lora"))?;
 
         let v_proj_config = LoraLinearConfig::new(hidden_size, num_kv_heads * head_dim);
-        let v_proj_id = 0;
-        self.v_proj.add_adapter(
-            &v_proj_config,
-            lora_config,
-            &vb.pp("v_proj.lora"),
-            v_proj_id,
-        )?;
+        self.v_proj
+            .add_adapter(&v_proj_config, lora_config, &vb.pp("v_proj.lora"))?;
 
         let o_proj_config = LoraLinearConfig::new(hidden_size, hidden_size);
-        let o_proj_id = 0;
-        self.o_proj.add_adapter(
-            &o_proj_config,
-            lora_config,
-            &vb.pp("o_proj.lora"),
-            o_proj_id,
-        )?;
+        self.o_proj
+            .add_adapter(&o_proj_config, lora_config, &vb.pp("o_proj.lora"))?;
 
         if self.q_proj.adapters.contains(&lora_config.name)
             || self.k_proj.adapters.contains(&lora_config.name)
@@ -715,7 +666,7 @@ impl Model {
         Ok(causal_mask)
     }
 
-    fn add_adapter(
+    pub fn add_adapter(
         &mut self,
         cfg: &Config,
         vb: VarBuilder,
@@ -734,7 +685,7 @@ impl Model {
         }
     }
 
-    fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
+    pub fn activate_adapter(&mut self, adapter_name: Option<&str>) -> Result<()> {
         self.active_adapter = adapter_name.map(String::from);
         for i in 0..self.layers.len() {
             self.layers[i].activate_adapter(adapter_name)?;

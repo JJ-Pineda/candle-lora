@@ -22,9 +22,8 @@ impl MultiLoraLinear {
         linear_config: &LoraLinearConfig,
         config: &LoraConfig,
         vb: &VarBuilder,
-        id: usize,
     ) -> Result<Self> {
-        let (a, b, m) = MultiLoraLinear::get_adapter_weights(linear_config, config, vb, id);
+        let (a, b, m) = MultiLoraLinear::get_adapter_weights(linear_config, config, vb);
 
         let (a_map, b_map, m_map, scale_map, active_adapter) = if a.is_some() && b.is_some() {
             let a_map = HashMap::from([(config.name.clone(), Linear::new(a.unwrap(), None))]);
@@ -71,7 +70,6 @@ impl MultiLoraLinear {
         linear_config: &LoraLinearConfig,
         config: &LoraConfig,
         vb: &VarBuilder,
-        id: usize,
     ) -> Result<()> {
         // Verify that adapter name doesn't already exist to avoid overwriting
         if self.ff_a.contains_key(&config.name) {
@@ -88,7 +86,7 @@ impl MultiLoraLinear {
             ));
         }
 
-        let (a, b, m) = MultiLoraLinear::get_adapter_weights(linear_config, config, vb, id);
+        let (a, b, m) = MultiLoraLinear::get_adapter_weights(linear_config, config, vb);
 
         if a.is_some() && b.is_some() {
             let scale = Some(config.alpha / config.rank as f64);
@@ -109,8 +107,8 @@ impl MultiLoraLinear {
         linear_config: &LoraLinearConfig,
         config: &LoraConfig,
         vb: &VarBuilder,
-        id: usize,
     ) -> (Option<Tensor>, Option<Tensor>, Option<Tensor>) {
+        let id = config.id;
         let a: Option<Tensor> = if vb.contains_tensor(&format!("a{id}.weight")) {
             vb.pp(format!("a{id}"))
                 .get((config.rank, linear_config.in_features), "weight")
