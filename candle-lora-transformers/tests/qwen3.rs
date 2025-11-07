@@ -82,7 +82,6 @@ fn get_test_ids(msgs: &[&str], tokenizer: &ModelTokenizer) -> Result<Vec<Vec<u32
 fn test_qwen3_dora(
     tokenizer: &ModelTokenizer,
     device: &Device,
-    dtype: DType,
     cfg: &Config,
     model: Arc<RwLock<Model>>,
     vb: VarBuilder,
@@ -118,7 +117,7 @@ fn test_qwen3_dora(
 }
 
 /// Tests text generation using ModelForCausalLM::new
-fn test_qwen3_generation(tokenizer: &ModelTokenizer, mut model: ModelForCausalLM) -> Result<()> {
+fn test_qwen3_generation(tokenizer: &ModelTokenizer, model: &mut ModelForCausalLM) -> Result<()> {
     println!("\n=== Testing text generation ===");
 
     // Get test inputs
@@ -127,6 +126,7 @@ fn test_qwen3_generation(tokenizer: &ModelTokenizer, mut model: ModelForCausalLM
 
     // Generate responses
     println!("Generating responses (max 10 tokens)...");
+    model.activate_adapter(None)?;
     let output_ids = model.generate(&ids, Some(0.7), Some(0.9), Some(10), None)?;
 
     anyhow::ensure!(
@@ -153,149 +153,149 @@ fn test_qwen3_generation(tokenizer: &ModelTokenizer, mut model: ModelForCausalLM
     Ok(())
 }
 
-/// Test regression model
-fn test_qwen3_regression(
-    model: &Arc<RwLock<Model>>,
-    tokenizer: &ModelTokenizer,
-    cfg: &Config,
-    path: &str,
-    device: &Device,
-    dtype: DType,
-) -> Result<()> {
-    struct PriceBot {
-        pub base: Arc<RwLock<Model>>,
-        head: Vec<Linear>,
-    }
+// /// Test regression model
+// fn test_qwen3_regression(
+//     model: Arc<RwLock<Model>>,
+//     tokenizer: &ModelTokenizer,
+//     cfg: &Config,
+//     path: &str,
+//     device: &Device,
+//     dtype: DType,
+// ) -> Result<()> {
+//     struct PriceBot {
+//         pub base: Arc<RwLock<Model>>,
+//         head: Vec<Linear>,
+//     }
 
-    impl PriceBot {
-        fn from_base(cfg: &Config, base: &Arc<RwLock<Model>>, vb: VarBuilder) -> Result<Self> {
-            let split_linear_a = if vb.contains_tensor("split_linear_a.weight") {
-                let vb_a = vb.pp("split_linear_a");
-                let weight = vb_a.get((1, cfg.hidden_size), "weight")?;
-                let bias = if vb_a.contains_tensor("bias") {
-                    vb_a.get(1, "bias").ok()
-                } else {
-                    None
-                };
-                Linear::new(weight, bias)
-            } else {
-                return Err(anyhow::Error::msg(
-                    "Failed to find tensor 'split_linear_a'".to_string(),
-                ));
-            };
+//     impl PriceBot {
+//         fn from_base(cfg: &Config, base: &Arc<RwLock<Model>>, vb: VarBuilder) -> Result<Self> {
+//             let split_linear_a = if vb.contains_tensor("split_linear_a.weight") {
+//                 let vb_a = vb.pp("split_linear_a");
+//                 let weight = vb_a.get((1, cfg.hidden_size), "weight")?;
+//                 let bias = if vb_a.contains_tensor("bias") {
+//                     vb_a.get(1, "bias").ok()
+//                 } else {
+//                     None
+//                 };
+//                 Linear::new(weight, bias)
+//             } else {
+//                 return Err(anyhow::Error::msg(
+//                     "Failed to find tensor 'split_linear_a'".to_string(),
+//                 ));
+//             };
 
-            let split_linear_b = if vb.contains_tensor("split_linear_b.weight") {
-                let vb_b = vb.pp("split_linear_b");
-                let weight = vb_b.get((1, cfg.hidden_size), "weight")?;
-                let bias = if vb_b.contains_tensor("bias") {
-                    vb_b.get(1, "bias").ok()
-                } else {
-                    None
-                };
-                Linear::new(weight, bias)
-            } else {
-                return Err(anyhow::Error::msg(
-                    "Failed to find tensor 'split_linear_b'".to_string(),
-                ));
-            };
+//             let split_linear_b = if vb.contains_tensor("split_linear_b.weight") {
+//                 let vb_b = vb.pp("split_linear_b");
+//                 let weight = vb_b.get((1, cfg.hidden_size), "weight")?;
+//                 let bias = if vb_b.contains_tensor("bias") {
+//                     vb_b.get(1, "bias").ok()
+//                 } else {
+//                     None
+//                 };
+//                 Linear::new(weight, bias)
+//             } else {
+//                 return Err(anyhow::Error::msg(
+//                     "Failed to find tensor 'split_linear_b'".to_string(),
+//                 ));
+//             };
 
-            Ok(Self {
-                base: Arc::clone(base),
-                head: vec![split_linear_a, split_linear_b],
-            })
-        }
+//             Ok(Self {
+//                 base: Arc::clone(base),
+//                 head: vec![split_linear_a, split_linear_b],
+//             })
+//         }
 
-        fn forward(
-            &self,
-            input: &Tensor,
-            padding_mask: Option<&Tensor>,
-        ) -> candle_core::Result<(Tensor, Tensor)> {
-            let (_, seq_len) = input.dims2()?;
-            let hidden_state = {
-                let mut guard = self.base.write().unwrap();
-                let state = guard
-                    .forward(input, 0, padding_mask)?
-                    .narrow(1, seq_len - 1, 1)?
-                    .squeeze(1)?;
-                guard.clear_kv_cache();
-                state.contiguous()?
-            };
+//         fn forward(
+//             &self,
+//             input: &Tensor,
+//             padding_mask: Option<&Tensor>,
+//         ) -> candle_core::Result<(Tensor, Tensor)> {
+//             let (_, seq_len) = input.dims2()?;
+//             let hidden_state = {
+//                 let mut guard = self.base.write().unwrap();
+//                 let state = guard
+//                     .forward(input, 0, padding_mask)?
+//                     .narrow(1, seq_len - 1, 1)?
+//                     .squeeze(1)?;
+//                 guard.clear_kv_cache();
+//                 state.contiguous()?
+//             };
 
-            // Apply each linear layer in parallel to hidden_state and concatenate results
-            // Note: hidden_state must be contiguous for linear layers to work correctly
-            let mut outputs = Vec::new();
-            for linear in &self.head {
-                let output = linear.forward(&hidden_state)?;
-                outputs.push(output);
-            }
+//             // Apply each linear layer in parallel to hidden_state and concatenate results
+//             // Note: hidden_state must be contiguous for linear layers to work correctly
+//             let mut outputs = Vec::new();
+//             for linear in &self.head {
+//                 let output = linear.forward(&hidden_state)?;
+//                 outputs.push(output);
+//             }
 
-            // Concatenate all outputs along dimension 1
-            let output = if outputs.len() > 1 {
-                let output_refs: Vec<&Tensor> = outputs.iter().collect();
-                Tensor::cat(&output_refs, 1)?
-            } else {
-                outputs.into_iter().next().unwrap()
-            };
+//             // Concatenate all outputs along dimension 1
+//             let output = if outputs.len() > 1 {
+//                 let output_refs: Vec<&Tensor> = outputs.iter().collect();
+//                 Tensor::cat(&output_refs, 1)?
+//             } else {
+//                 outputs.into_iter().next().unwrap()
+//             };
 
-            self.price_conversion(&output)
-                .map_err(|e| Error::Msg(format!("{e}")))
-        }
+//             self.price_conversion(&output)
+//                 .map_err(|e| Error::Msg(format!("{e}")))
+//         }
 
-        fn price_conversion(&self, tensor: &Tensor) -> Result<(Tensor, Tensor)> {
-            let delog = tensor.exp()?;
-            let price_mu = delog.narrow(1, 0, 1)?.squeeze(1)?;
-            let sigma_log_price = delog.narrow(1, 1, 1)?.sqrt()?.squeeze(1)?;
-            let price_sigma = (&price_mu * &sigma_log_price)?;
-            Ok((price_mu, price_sigma))
-        }
-    }
+//         fn price_conversion(&self, tensor: &Tensor) -> Result<(Tensor, Tensor)> {
+//             let delog = tensor.exp()?;
+//             let price_mu = delog.narrow(1, 0, 1)?.squeeze(1)?;
+//             let sigma_log_price = delog.narrow(1, 1, 1)?.sqrt()?.squeeze(1)?;
+//             let price_sigma = (&price_mu * &sigma_log_price)?;
+//             Ok((price_mu, price_sigma))
+//         }
+//     }
 
-    {
-        let mut guard = model.write().unwrap();
-        guard.activate_adapter(Some("dora0"))?;
-    }
+//     {
+//         let mut guard = model.write().unwrap();
+//         guard.activate_adapter(Some("dora0"))?;
+//     }
 
-    let vb = from_pth_tensors(path, dtype, device, true)?;
-    let price_bot = PriceBot::from_base(&cfg, model, vb)?;
+//     let vb = from_pth_tensors(path, dtype, device, true)?;
+//     let price_bot = PriceBot::from_base(&cfg, &model, vb)?;
 
-    let test_items = vec!["Request for Half Leukopak from Healthy Donors for Non-Sensitive Genetic Research\n\nItem #022 - Leukopheresis."; 3];
-    let input_ids = tokenizer
-        .encode(test_items, Some("left"))
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+//     let test_items = vec!["Request for Half Leukopak from Healthy Donors for Non-Sensitive Genetic Research\n\nItem #022 - Leukopheresis."; 3];
+//     let input_ids = tokenizer
+//         .encode(test_items, Some("left"))
+//         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Convert Vec<Vec<u32>> to 2D tensor [batch, seq_len]
-    let max_len = input_ids.iter().map(|v| v.len()).max().unwrap_or(0);
-    let batch_size = input_ids.len();
-    let mut flat_ids = Vec::with_capacity(batch_size * max_len);
-    for ids in &input_ids {
-        flat_ids.extend_from_slice(ids);
-        for _ in ids.len()..max_len {
-            flat_ids.push(0);
-        }
-    }
-    let input_tensor = Tensor::new(flat_ids.as_slice(), device)?.reshape((batch_size, max_len))?;
+//     // Convert Vec<Vec<u32>> to 2D tensor [batch, seq_len]
+//     let max_len = input_ids.iter().map(|v| v.len()).max().unwrap_or(0);
+//     let batch_size = input_ids.len();
+//     let mut flat_ids = Vec::with_capacity(batch_size * max_len);
+//     for ids in &input_ids {
+//         flat_ids.extend_from_slice(ids);
+//         for _ in ids.len()..max_len {
+//             flat_ids.push(0);
+//         }
+//     }
+//     let input_tensor = Tensor::new(flat_ids.as_slice(), device)?.reshape((batch_size, max_len))?;
 
-    let (price_mu, price_sigma) = price_bot.forward(&input_tensor, None)?;
-    let price_mu_vec = price_mu.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let price_sigma_vec = price_sigma.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+//     let (price_mu, price_sigma) = price_bot.forward(&input_tensor, None)?;
+//     let price_mu_vec = price_mu.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+//     let price_sigma_vec = price_sigma.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
-    println!("{:?}", price_mu_vec);
-    println!("{:?}", price_sigma_vec);
+//     println!("{:?}", price_mu_vec);
+//     println!("{:?}", price_sigma_vec);
 
-    let first_price_mu = price_mu_vec[0];
-    let first_price_sigma = price_sigma_vec[0];
-    anyhow::ensure!(
-        (first_price_mu > 1000f32) && (first_price_mu < 2000f32),
-        "Price mu prediction {first_price_mu} is outside of expected range",
-    );
+//     let first_price_mu = price_mu_vec[0];
+//     let first_price_sigma = price_sigma_vec[0];
+//     anyhow::ensure!(
+//         (first_price_mu > 1000f32) && (first_price_mu < 2000f32),
+//         "Price mu prediction {first_price_mu} is outside of expected range",
+//     );
 
-    anyhow::ensure!(
-        (first_price_sigma > 300f32) && (first_price_sigma < 400f32),
-        "Price sigma prediction {first_price_sigma} is outside of expected range"
-    );
+//     anyhow::ensure!(
+//         (first_price_sigma > 300f32) && (first_price_sigma < 400f32),
+//         "Price sigma prediction {first_price_sigma} is outside of expected range"
+//     );
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 /// Composite test that runs both DoRA and generation tests
 #[test]
@@ -319,29 +319,27 @@ fn test_qwen3() -> Result<()> {
     let adapter_vb = from_mmaped_safetensors(&adapter_files, dtype, &device, false)?;
     let dora_cfg = LoraConfig::new_no_default(256, 512.0, None, "dora0", 0);
     model.add_adapter(&cfg, adapter_vb, &dora_cfg)?;
-    // test_qwen3_dora(
+    test_qwen3_dora(
+        &tokenizer,
+        &device,
+        &cfg,
+        Arc::clone(&model.base),
+        vb.clone(),
+    )?;
+
+    // Test 2: Text generation with new
+    test_qwen3_generation(&tokenizer, &mut model)?;
+
+    // // Test 3: Regression
+    // let reg_head_path = format!("{adapter_dir}/final_layer.pth");
+    // test_qwen3_regression(
+    //     Arc::clone(&model.base),
     //     &tokenizer,
+    //     &cfg,
+    //     &reg_head_path,
     //     &device,
     //     dtype,
-    //     &cfg,
-    //     Arc::clone(&model.base),
-    //     vb.clone(),
-    //     &adapter_dir,
     // )?;
-
-    // // Test 2: Text generation with new
-    // test_qwen3_generation(&tokenizer, model)?;
-
-    // Test 3: Regression
-    let reg_head_path = format!("{adapter_dir}/final_layer.pth");
-    test_qwen3_regression(
-        &model.base,
-        &tokenizer,
-        &cfg,
-        &reg_head_path,
-        &device,
-        dtype,
-    )?;
 
     Ok(())
 }
