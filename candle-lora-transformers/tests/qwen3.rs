@@ -5,7 +5,6 @@ use candle_lora_transformers::qwen3::{Config, Model, ModelForCausalLM, ModelToke
 use candle_lora_transformers::varbuilder_utils::{from_mmaped_safetensors, from_pth_tensors};
 use candle_nn::VarBuilder;
 use std::sync::{Arc, RwLock};
-use tokenizers::Tokenizer;
 
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -201,7 +200,7 @@ fn test_qwen3_regression(
             &self,
             input: &Tensor,
             padding_mask: Option<&Tensor>,
-        ) -> candle_core::Result<Tensor> {
+        ) -> candle_core::Result<(Tensor, Tensor)> {
             let (_, seq_len) = input.dims2()?;
             let hidden_state = {
                 let mut guard = self.base.write().unwrap();
@@ -233,7 +232,17 @@ fn test_qwen3_regression(
             let weighted = (&hidden_expanded * &head_expanded)?;
             // Sum across hidden dimension: [out_features, batch, hidden_dim] -> [out_features, batch]
             let output = weighted.sum(2)?.t()?; // [out_features, batch] -> [batch, out_features]
-            Ok(output)
+
+            self.price_conversion(&output)
+                .map_err(|e| Error::Msg(format!("{e}")))
+        }
+
+        fn price_conversion(&self, tensor: &Tensor) -> Result<(Tensor, Tensor)> {
+            let delog = tensor.exp()?;
+            let price_mu = delog.narrow(1, 0, 1)?.squeeze(1)?;
+            let sigma_log_price = delog.narrow(1, 1, 1)?.sqrt()?.squeeze(1)?;
+            let price_sigma = (&price_mu * &sigma_log_price)?;
+            Ok((price_mu, price_sigma))
         }
     }
 
@@ -262,13 +271,21 @@ fn test_qwen3_regression(
     }
     let input_tensor = Tensor::new(flat_ids.as_slice(), device)?.reshape((batch_size, max_len))?;
 
-    let output = price_bot
-        .forward(&input_tensor, None)?
-        .to_dtype(DType::F32)?;
+    let (price_mu, price_sigma) = price_bot.forward(&input_tensor, None)?;
+    let price_mu_vec = price_mu.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let price_sigma_vec = price_sigma.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
-    let output_vec: Vec<Vec<f32>> = output.to_vec2::<f32>()?;
+    let first_price_mu = price_mu_vec[0];
+    let first_price_sigma = price_sigma_vec[0];
+    anyhow::ensure!(
+        (first_price_mu > 1000f32) && (first_price_mu < 2000f32),
+        "Price mu prediction {first_price_mu} is outside of expected range",
+    );
 
-    println!("{:?}", output_vec);
+    anyhow::ensure!(
+        (first_price_sigma > 300f32) && (first_price_sigma < 400f32),
+        "Price sigma prediction {first_price_sigma} is outside of expected range"
+    );
 
     Ok(())
 }
