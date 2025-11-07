@@ -174,7 +174,7 @@ fn test_qwen3_regression(
 ) -> Result<()> {
     struct PriceBot {
         pub base: Arc<RwLock<Model>>,
-        head: Vec<Tensor>,
+        head: Tensor,
     }
 
     impl PriceBot {
@@ -197,9 +197,12 @@ fn test_qwen3_regression(
                 ));
             };
 
+            // Stack tensors and squeeze to get [out_features, hidden_size]
+            let head = Tensor::stack(&[split_linear_a, split_linear_b], 0)?.squeeze(1)?;
+
             Ok(Self {
                 base: Arc::clone(base),
-                head: vec![split_linear_a, split_linear_b],
+                head,
             })
         }
 
@@ -208,44 +211,68 @@ fn test_qwen3_regression(
             input: &Tensor,
             padding_mask: Option<&Tensor>,
         ) -> candle_core::Result<Tensor> {
-            let (b, l) = input.dims2()?;
+            let (_, seq_len) = input.dims2()?;
             let hidden_state = {
                 let mut guard = self.base.write().unwrap();
                 let state = guard
                     .forward(input, 0, padding_mask)?
-                    .narrow(1, l - 1, 1)?
+                    .narrow(1, seq_len - 1, 1)?
                     .squeeze(1)?;
                 guard.clear_kv_cache();
                 state
             };
 
-            let out_tensors = self
-                .head
-                .iter()
-                .map(|t| {
-                    hidden_state
-                        .matmul(t.unsqueeze(0)?)
-                        .map_err(Error::Msg("".to_string()))
-                })
-                .collect::<Result<Vec<Tensor>, Error>>()?;
+            // Apply regression head: [batch, hidden] @ [out_features, hidden].t() = [batch, out_features]
+            // Use element-wise operations: multiply each row of hidden_state by each row of head, then sum
+            let (batch_size, hidden_dim) = hidden_state.dims2()?;
+            let (out_features, _) = self.head.dims2()?;
 
-            Tensor::stack(&out_tensors, 1)
+            // Reshape head to [out_features, 1, hidden_dim] and hidden_state to [1, batch, hidden_dim]
+            // Then multiply and sum across last dimension
+            let head_expanded =
+                self.head
+                    .unsqueeze(1)?
+                    .broadcast_as((out_features, batch_size, hidden_dim))?;
+            let hidden_expanded =
+                hidden_state
+                    .unsqueeze(0)?
+                    .broadcast_as((out_features, batch_size, hidden_dim))?;
+
+            // Element-wise multiply: [out_features, batch, hidden_dim] * [out_features, batch, hidden_dim]
+            let weighted = (&hidden_expanded * &head_expanded)?;
+            // Sum across hidden dimension: [out_features, batch, hidden_dim] -> [out_features, batch]
+            let output = weighted.sum(2)?.t()?; // [out_features, batch] -> [batch, out_features]
+            Ok(output)
         }
     }
 
     let vb = from_pth_tensors(path, dtype, device, true)?;
     let price_bot = PriceBot::from_base(&cfg, model, vb)?;
 
-    let test_items = vec!["Request for Half Leukopak from Healthy Donors for Non-Sensitive Genetic Research\n\nItem #022 - Leukopheresis."];
+    let test_items = vec!["Request for Half Leukopak from Healthy Donors for Non-Sensitive Genetic Research\n\nItem #022 - Leukopheresis."; 3];
     let input_ids = tokenizer
         .encode(test_items, Some("left"))
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let input_tensor = Tensor::new(input_ids, device)?;
+    // Convert Vec<Vec<u32>> to 2D tensor [batch, seq_len]
+    let max_len = input_ids.iter().map(|v| v.len()).max().unwrap_or(0);
+    let batch_size = input_ids.len();
+    let mut flat_ids = Vec::with_capacity(batch_size * max_len);
+    for ids in &input_ids {
+        flat_ids.extend_from_slice(ids);
+        for _ in ids.len()..max_len {
+            flat_ids.push(0);
+        }
+    }
+    let input_tensor = Tensor::new(flat_ids.as_slice(), device)?.reshape((batch_size, max_len))?;
 
-    let output = price_bot.forward(&input_tensor, None)?;
+    let output = price_bot
+        .forward(&input_tensor, None)?
+        .to_dtype(DType::F32)?;
 
-    println!("{:?}", output);
+    let output_vec: Vec<Vec<f32>> = output.to_vec2::<f32>()?;
+
+    println!("{:?}", output_vec);
 
     Ok(())
 }
